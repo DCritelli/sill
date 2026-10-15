@@ -8,7 +8,7 @@ import StreamProtocol
 /// the parameter sets, one sample buffer per access unit, shown at once), without its pointer
 /// sprite: the Mac Client sets the local cursor instead (DCritelli/sill#3).
 ///
-/// The mouse goes through the input translator (InputTranslator.swift), which also says where the
+/// The mouse and scrolling go through the input translator (InputTranslator.swift), which also says where the
 /// picture is drawn, fitted with bars; the view only feeds it AppKit's events and hands on what it
 /// returns (`onInput`). Over the picture the cursor is the Host's shape, through a cursor rect, so
 /// AppKit swaps it as the pointer crosses the edge with nothing drawn by hand; elsewhere it is the
@@ -106,6 +106,37 @@ final class VideoView: NSView {
     override func mouseUp(with event: NSEvent) { hand(translator.mouseUp(.left, at: point(event))) }
     override func rightMouseDown(with event: NSEvent) { hand(translator.mouseDown(.right, at: point(event))) }
     override func rightMouseUp(with event: NSEvent) { hand(translator.mouseUp(.right, at: point(event))) }
+
+    /// Scrolling (DCritelli/sill#5): a trackpad's precise deltas are points; a wheel's are lines, so
+    /// its point deltas come from the CGEvent (the pixels macOS would scroll a local view by).
+    /// AppKit's deltas already follow the natural-scrolling setting, so they go to the translator
+    /// as they are, with the phases it maps to the Host's gesture and momentum.
+    override func scrollWheel(with event: NSEvent) {
+        var dx = event.scrollingDeltaX, dy = event.scrollingDeltaY
+        if !event.hasPreciseScrollingDeltas, let cg = event.cgEvent {
+            dx = cg.getDoubleValueField(.scrollWheelEventPointDeltaAxis2)
+            dy = cg.getDoubleValueField(.scrollWheelEventPointDeltaAxis1)
+        }
+        hand(translator.scrolled(at: point(event), dx: dx, dy: dy,
+                                 phase: Self.gesturePhase(event.phase), momentum: Self.momentumPhase(event.momentumPhase)))
+    }
+
+    private static func gesturePhase(_ phase: NSEvent.Phase) -> InputTranslator.GesturePhase {
+        if phase.contains(.began) { return .began }
+        if phase.contains(.changed) { return .changed }
+        if phase.contains(.ended) { return .ended }
+        if phase.contains(.cancelled) { return .cancelled }
+        if phase.contains(.mayBegin) { return .mayBegin }
+        if phase.contains(.stationary) { return .stationary }
+        return .none
+    }
+
+    private static func momentumPhase(_ phase: NSEvent.Phase) -> InputTranslator.MomentumPhase {
+        if phase.contains(.began) { return .began }
+        if phase.contains(.changed) || phase.contains(.stationary) { return .changed }
+        if phase.contains(.ended) || phase.contains(.cancelled) { return .ended }
+        return .none
+    }
 
     /// A new format: the Host repeats its parameter sets with every keyframe, and only a real
     /// change (a new Source, a resize) needs a new description and a blank layer.

@@ -23,7 +23,15 @@ import StreamProtocol
 /// - **Drags:** while a button the Host was sent is held, every move goes out, held at the
 ///   picture's edge when the pointer leaves it, and so does its up.
 ///
-/// Later tickets grow it (keys and focus #4, scrolling #5, the Viewport #6) with more entry points
+/// - **Scrolling (#5):** AppKit's deltas in points (already the content's motion: positive y moves
+///   it down, positive x right, as the protocol's sign) go out as fractions of the picture. A
+///   trackpad's phases become `scrollGesture` began and ended (a cancel ends it too), and its own
+///   momentum phases momentumBegan and momentumEnded around the coast's deltas, so the Host gets
+///   the trackpad's momentum rather than making one. A wheel (no phase, no momentum) sends plain
+///   scrolls. A gesture begun over the bars is not the Host's, nor its momentum; one begun over the
+///   picture is held at its edge until it ends. Fingers down during a coast end the coast first.
+///
+/// Later tickets grow it (keys and focus #4, the Viewport #6) with more entry points
 /// of the same shape: a happening in, the messages out. Checked with swiftc
 /// (Tests/checks/input-translator).
 struct InputTranslator {
@@ -36,8 +44,23 @@ struct InputTranslator {
     /// The video frame's size (pixels or points: only its aspect counts), nil before the first one.
     var frameSize: CGSize?
 
+    /// A trackpad scroll's phase, as AppKit's `NSEvent.phase` gives it (`none` for a wheel or a
+    /// momentum event).
+    enum GesturePhase {
+        case none, mayBegin, began, changed, stationary, ended, cancelled
+    }
+    /// A trackpad scroll's momentum phase, as AppKit's `NSEvent.momentumPhase` gives it.
+    enum MomentumPhase {
+        case none, began, changed, ended
+    }
+
     /// Buttons whose down the Host was sent and whose up it has not been.
     private var held: Set<Button> = []
+
+    /// Where the trackpad scroll the Host was sent stands: nothing open, a gesture open, a gesture
+    /// ended (its momentum may follow), or a coast open. A gesture begun over the bars leaves it idle.
+    private enum Scrolling { case idle, gesture, ended, momentum }
+    private var scrolling = Scrolling.idle
 
     /// Where the picture is drawn: the frame fitted into the view and centred, so bars fill the
     /// rest. nil while there is no frame or no room.
@@ -64,6 +87,50 @@ struct InputTranslator {
     mutating func mouseUp(_ button: Button, at point: CGPoint) -> [InputEvent] {
         guard held.remove(button) != nil, let p = normalized(point, clamped: true) else { return [] }
         return [.pointer(button == .left ? .leftUp : .rightUp, x: p.x, y: p.y)]
+    }
+
+    /// A scroll event: pixel deltas (points) at `point`, with its trackpad phase and momentum phase.
+    mutating func scrolled(at point: CGPoint, dx: CGFloat, dy: CGFloat,
+                           phase: GesturePhase, momentum: MomentumPhase) -> [InputEvent] {
+        switch (phase, momentum) {
+        case (.none, .none):   // a wheel: plain scrolls over the picture
+            guard let p = normalized(point) else { return [] }
+            return delta(at: p, dx: dx, dy: dy)
+        case (.began, _):
+            var out: [InputEvent] = []
+            if scrolling == .momentum, let p = normalized(point, clamped: true) {
+                out.append(.scrollGesture(.momentumEnded, x: p.x, y: p.y))
+            }
+            guard let p = normalized(point) else { scrolling = .idle; return out }
+            scrolling = .gesture
+            return out + [.scrollGesture(.began, x: p.x, y: p.y)] + delta(at: p, dx: dx, dy: dy)
+        case (.changed, _):
+            guard scrolling == .gesture, let p = normalized(point, clamped: true) else { return [] }
+            return delta(at: p, dx: dx, dy: dy)
+        case (.ended, _), (.cancelled, _):
+            guard scrolling == .gesture, let p = normalized(point, clamped: true) else { return [] }
+            scrolling = .ended
+            return [.scrollGesture(.ended, x: p.x, y: p.y)]
+        case (.none, .began):
+            guard scrolling == .ended, let p = normalized(point, clamped: true) else { return [] }
+            scrolling = .momentum
+            return [.scrollGesture(.momentumBegan, x: p.x, y: p.y)] + delta(at: p, dx: dx, dy: dy)
+        case (.none, .changed):
+            guard scrolling == .momentum, let p = normalized(point, clamped: true) else { return [] }
+            return delta(at: p, dx: dx, dy: dy)
+        case (.none, .ended):
+            guard scrolling == .momentum, let p = normalized(point, clamped: true) else { return [] }
+            scrolling = .idle
+            return [.scrollGesture(.momentumEnded, x: p.x, y: p.y)]
+        case (.mayBegin, _), (.stationary, _):
+            return []
+        }
+    }
+
+    /// One scroll of `dx`, `dy` points as fractions of the picture, or nothing when it does not move.
+    private func delta(at p: (x: Double, y: Double), dx: CGFloat, dy: CGFloat) -> [InputEvent] {
+        guard let rect = pictureRect, dx != 0 || dy != 0 else { return [] }
+        return [.scroll(x: p.x, y: p.y, dx: Double(dx / rect.width), dy: Double(dy / rect.height))]
     }
 
     /// `point` as fractions of the picture: nil outside it, or held at its edge when `clamped`.

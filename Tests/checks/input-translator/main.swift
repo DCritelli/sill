@@ -135,5 +135,111 @@ do {
     check(t.mouseUp(.right, at: pt(20, 300)) == [], "and its up nothing")
 }
 
+// MARK: Scrolling (DCritelli/sill#5)
+
+/// AppKit's scroll deltas (scrollingDeltaX/Y, in points) are already the content's motion: positive
+/// y moves the content down (with natural scrolling, the fingers dragged down), positive x moves it
+/// right. The protocol's sign is the same, so a delta goes out as the same sign, a fraction of the
+/// picture's size.
+func scroll(_ x: Double, _ y: Double, _ dx: Double, _ dy: Double) -> InputEvent { .scroll(x: x, y: y, dx: dx, dy: dy) }
+func gesture(_ phase: ScrollPhase, _ x: Double, _ y: Double) -> InputEvent { .scrollGesture(phase, x: x, y: y) }
+
+do {
+    // A trackpad flick with no bars: an 800×500 view, the pointer at the middle.
+    var t = translator(content: size(800, 500), frame: size(1600, 1000))
+    let mid = pt(400, 250)
+    check(t.scrolled(at: mid, dx: 0, dy: 0, phase: .mayBegin, momentum: .none) == [],
+          "fingers resting (mayBegin): nothing yet")
+    check(t.scrolled(at: mid, dx: 0, dy: 125, phase: .began, momentum: .none) == [gesture(.began, 0.5, 0.5), scroll(0.5, 0.5, 0, 0.25)],
+          "a trackpad scroll begins: began, then its delta (125 of 500 points down is 0.25)")
+    check(t.scrolled(at: mid, dx: 200, dy: -250, phase: .changed, momentum: .none) == [scroll(0.5, 0.5, 0.25, -0.5)],
+          "changed: both axes, each a fraction of the picture, signs kept")
+    check(t.scrolled(at: mid, dx: 0, dy: 0, phase: .stationary, momentum: .none) == [],
+          "fingers holding still: nothing")
+    check(t.scrolled(at: mid, dx: 0, dy: 0, phase: .ended, momentum: .none) == [gesture(.ended, 0.5, 0.5)],
+          "the fingers lift: ended")
+    check(t.scrolled(at: mid, dx: 0, dy: 50, phase: .none, momentum: .began) == [gesture(.momentumBegan, 0.5, 0.5), scroll(0.5, 0.5, 0, 0.1)],
+          "the trackpad's own momentum begins: momentumBegan, then its delta")
+    check(t.scrolled(at: mid, dx: -100, dy: 0, phase: .none, momentum: .changed) == [scroll(0.5, 0.5, -0.125, 0)],
+          "momentum continues: a leftward delta stays negative")
+    check(t.scrolled(at: mid, dx: 0, dy: 0, phase: .none, momentum: .ended) == [gesture(.momentumEnded, 0.5, 0.5)],
+          "momentum ends: momentumEnded")
+    check(t.scrolled(at: mid, dx: 0, dy: 0, phase: .none, momentum: .ended) == [], "a second momentum end: nothing")
+    check(t.scrolled(at: mid, dx: 0, dy: 125, phase: .began, momentum: .none) == [gesture(.began, 0.5, 0.5), scroll(0.5, 0.5, 0, 0.25)],
+          "the next gesture after a finished coast: began alone, no stray momentumEnded")
+}
+do {
+    // A wheel mouse: no phase, no momentum: plain scrolls, never a gesture.
+    var t = translator(content: size(800, 500), frame: size(1600, 1000))
+    check(t.scrolled(at: pt(200, 125), dx: 0, dy: 50, phase: .none, momentum: .none) == [scroll(0.25, 0.25, 0, 0.1)],
+          "a wheel tick down: a plain scroll, no gesture")
+    check(t.scrolled(at: pt(200, 125), dx: 0, dy: -50, phase: .none, momentum: .none) == [scroll(0.25, 0.25, 0, -0.1)],
+          "a wheel tick up: negative")
+    check(t.scrolled(at: pt(200, 125), dx: 400, dy: 0, phase: .none, momentum: .none) == [scroll(0.25, 0.25, 0.5, 0)],
+          "a horizontal wheel (shift-scroll or a tilt wheel): dx alone, a fraction of the width")
+    check(t.scrolled(at: pt(200, 125), dx: 0, dy: 0, phase: .none, momentum: .none) == [],
+          "a scroll event with no motion: nothing")
+}
+do {
+    // With bars: fractions of the picture, not the view. A 1000×500 view, the picture 800×500 at x 100.
+    var t = translator(content: size(1000, 500), frame: size(1600, 1000))
+    check(t.scrolled(at: pt(300, 375), dx: 200, dy: 250, phase: .none, momentum: .none) == [scroll(0.25, 0.75, 0.25, 0.5)],
+          "bars left and right: the position from the picture's edge, dx a fraction of the picture's 800")
+    // A 800×700 view, the picture 800×500 at y 100: dy a fraction of 500, not 700.
+    var u = translator(content: size(800, 700), frame: size(1600, 1000))
+    check(u.scrolled(at: pt(400, 225), dx: 0, dy: 125, phase: .none, momentum: .none) == [scroll(0.5, 0.25, 0, 0.25)],
+          "bars above and below: dy a fraction of the picture's 500")
+    // Over a bar: a wheel sends nothing, nor does a gesture that begins there, nor its momentum.
+    check(t.scrolled(at: pt(50, 250), dx: 0, dy: 50, phase: .none, momentum: .none) == [], "a wheel over a bar: nothing")
+    check(t.scrolled(at: pt(50, 250), dx: 0, dy: 50, phase: .began, momentum: .none) == [], "a gesture begun over a bar: nothing")
+    check(t.scrolled(at: pt(500, 250), dx: 0, dy: 50, phase: .changed, momentum: .none) == [],
+          "that gesture moving over the picture: still not the Host's")
+    check(t.scrolled(at: pt(500, 250), dx: 0, dy: 0, phase: .ended, momentum: .none) == [], "its end: nothing")
+    check(t.scrolled(at: pt(500, 250), dx: 0, dy: 50, phase: .none, momentum: .began) == [] &&
+          t.scrolled(at: pt(500, 250), dx: 0, dy: 0, phase: .none, momentum: .ended) == [],
+          "its momentum: nothing")
+    // No picture yet: nothing.
+    var v = translator(content: size(800, 500), frame: nil)
+    check(v.scrolled(at: pt(400, 250), dx: 0, dy: 50, phase: .none, momentum: .none) == [], "no picture yet: no scroll")
+}
+do {
+    // A gesture begun on the picture keeps going when the pointer drifts over a bar: held at the edge.
+    var t = translator(content: size(1000, 500), frame: size(1600, 1000))   // the picture at x 100…900
+    _ = t.scrolled(at: pt(500, 250), dx: 0, dy: 50, phase: .began, momentum: .none)
+    check(t.scrolled(at: pt(40, 125), dx: 0, dy: 50, phase: .changed, momentum: .none) == [scroll(0, 0.25, 0, 0.1)],
+          "a gesture's pointer over the left bar: held at the edge")
+    check(t.scrolled(at: pt(40, 125), dx: 0, dy: 0, phase: .ended, momentum: .none) == [gesture(.ended, 0, 0.25)],
+          "and it ends there, at the edge")
+    check(t.scrolled(at: pt(960, 375), dx: 0, dy: 50, phase: .none, momentum: .began) == [gesture(.momentumBegan, 1, 0.75), scroll(1, 0.75, 0, 0.1)],
+          "its momentum over the right bar: still the Host's, at the edge")
+    check(t.scrolled(at: pt(960, 375), dx: 0, dy: 0, phase: .none, momentum: .ended) == [gesture(.momentumEnded, 1, 0.75)],
+          "its momentum ends at the edge")
+    check(t.scrolled(at: pt(960, 375), dx: 0, dy: 50, phase: .none, momentum: .none) == [],
+          "after it, a wheel over the bar: nothing again")
+}
+do {
+    // A cancelled gesture closes as ended; a new gesture during momentum ends the momentum first.
+    var t = translator(content: size(800, 500), frame: size(1600, 1000))
+    let mid = pt(400, 250)
+    _ = t.scrolled(at: mid, dx: 0, dy: 50, phase: .began, momentum: .none)
+    check(t.scrolled(at: mid, dx: 0, dy: 0, phase: .cancelled, momentum: .none) == [gesture(.ended, 0.5, 0.5)],
+          "a gesture cancelled: ended, so the Host closes it")
+    check(t.scrolled(at: mid, dx: 0, dy: 0, phase: .mayBegin, momentum: .none) == [] &&
+          t.scrolled(at: mid, dx: 0, dy: 0, phase: .cancelled, momentum: .none) == [],
+          "fingers that rest and lift without scrolling (mayBegin, cancelled): nothing")
+    _ = t.scrolled(at: mid, dx: 0, dy: 50, phase: .began, momentum: .none)
+    _ = t.scrolled(at: mid, dx: 0, dy: 0, phase: .ended, momentum: .none)
+    _ = t.scrolled(at: mid, dx: 0, dy: 50, phase: .none, momentum: .began)
+    check(t.scrolled(at: mid, dx: 0, dy: 125, phase: .began, momentum: .none) ==
+          [gesture(.momentumEnded, 0.5, 0.5), gesture(.began, 0.5, 0.5), scroll(0.5, 0.5, 0, 0.25)],
+          "fingers down during momentum: momentumEnded, then the new gesture")
+    check(t.scrolled(at: mid, dx: 0, dy: 0, phase: .none, momentum: .ended) == [],
+          "the old momentum's late end: nothing more")
+    check(t.scrolled(at: mid, dx: 0, dy: 0, phase: .ended, momentum: .none) == [gesture(.ended, 0.5, 0.5)],
+          "the new gesture ends")
+    check(t.scrolled(at: mid, dx: 0, dy: 50, phase: .none, momentum: .changed) == [],
+          "a momentum delta with no momentum begun: nothing")
+}
+
 print(failures == 0 ? "All \(checks) checks passed." : "\(failures) of \(checks) checks FAILED.")
 exit(failures == 0 ? 0 : 1)

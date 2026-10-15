@@ -4601,7 +4601,7 @@ good.
 - `Sources/SillClient/` — Sill Client, the Mac Client (docs/adr/0001–0003;
   bundled by `Scripts/make-client-app.sh`): `ClientSession` (one Host
   connection, AppKit-free, `Tests/checks/client-session`), `HostBrowser`,
-  `VideoView` (the picture where the translator puts it, the mouse, the Host's
+  `VideoView` (the picture where the translator puts it, the mouse and scrolling, the Host's
   cursor shape through a cursor rect), `AppDelegate`, `InputTranslator` (the
   spec's Seam 1: Mac-side happenings in, InputEvents and the picture's
   rectangle out; pure, `Tests/checks/input-translator`), and
