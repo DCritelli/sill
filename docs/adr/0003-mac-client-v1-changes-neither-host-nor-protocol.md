@@ -1,0 +1,3 @@
+# The Mac Client's v1 changes neither the Host nor the protocol
+
+The first Mac Client works with today's Host and `sill/1` exactly as they are. That vocabulary was shaped by touch. So keypad keys are sent as text, keys the Host has no mapping for (F13 and up, ISO/JIS extras, media keys) are dropped, and there are no middle or extra mouse buttons and no pinch or rotate. The Host treats every Device alike and shows one Source to all of them, so a Mac Client and an iPhone on the same Host share one Window. This keeps the fork mergeable upstream and keeps every Host since 0.4.0 working. Fuller keyboard and mouse support is a later, additive Host change that older Devices can skip.

@@ -4598,6 +4598,14 @@ good.
   address; pure, checked with swiftc), `UpdatePolicy` (the update check's rules
   and words; pure, checked with swiftc) and `UpdateChecker` (main actor; asks
   GitHub's releases feed and times the checks; compiles on its own with swiftc).
+- `Sources/SillClient/` — Sill Client, the Mac Client (docs/adr/0001–0003;
+  bundled by `Scripts/make-client-app.sh`): `ClientSession` (one Host
+  connection, AppKit-free, `Tests/checks/client-session`), `HostBrowser`,
+  `VideoView` (the picture where the translator puts it, the mouse, the Host's
+  cursor shape through a cursor rect), `AppDelegate`, `InputTranslator` (the
+  spec's Seam 1: Mac-side happenings in, InputEvents and the picture's
+  rectangle out; pure, `Tests/checks/input-translator`), and
+  `MessageReader.swift`, a symlink into iOSClient/ (ADR-0002).
 - `Packaging/` — Sill.app's `Info.plist` and the development entitlements
   (get-task-allow only), the release's (`SillRelease.entitlements`:
   `com.apple.application-identifier`, the team and the keychain group, signed
@@ -4969,13 +4977,15 @@ good.
   caught), and `build.sh` where a check compiles a module (StreamProtocol's
   sources with `import StreamProtocol` stripped), or a `module.txt` naming the
   files `module.py` compiles as one module (pairing at home's checks):
-  `addresses`, `ask-limits`, `cable-link`, `clientlink`, `compatibility`,
+  `addresses`, `ask-limits`, `cable-link`, `client-session`, `clientlink`, `compatibility`,
   `device-gate`, `dmg-layout` (Scripts/dmg-layout's `.DS_Store` and alias
   writer, against Finder's own layout of the file, make-dmg.sh's layout
   arguments and the SVG's size and edge), `door-policy`, `duo` (DuoPosture;
   `tour` and `phone-portrait` take the Duo's real sizes too), `encoder-mailbox`,
   `encoder-slowstate`, `fence`, `gesture-chords`, `gestures`, `goodbye`,
-  `home-device`, `home-model`, `home-records`, `home-txt`, `key-strokes` (the
+  `home-device`, `home-model`, `home-records`, `home-txt`, `input-translator`
+  (the Mac Client's mouse: the fitted picture, positions, the held drag),
+  `key-strokes` (the
   host's KeyStrokes and the device's KeyChords, against a model of the Mac's
   HID state table and of a Mac from before), `ledger`,
   `menu-state` (iOSClient's MacMenuState), `menus` (the host's MenuFormat and
@@ -5476,3 +5486,17 @@ device keeps working with Macs from the first public build on, or each says why
 - License: Apache-2.0, LICENSE since PR #15, kept when the repository went
   public on 2026-09-26 (paid plan is gone, so no GPL/CLA needed).
 - v1 out of scope: hole punching, multi-window, layout customization, audio.
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues on the fork, DCritelli/sill (not upstream Saffsanity/sill). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five default labels: needs-triage, needs-info, ready-for-agent, ready-for-human, wontfix. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `GLOSSARY.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
