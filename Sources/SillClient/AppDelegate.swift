@@ -17,6 +17,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                           backing: .buffered, defer: false)
         window.title = "Looking for a Mac…"
         window.contentView = video
+        window.makeFirstResponder(video)
+        NSApp.mainMenu = Self.mainMenu()
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -64,6 +66,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.session = session
         print("Connecting to \(name)")
         session.start()
+    }
+
+    /// Sill Client's own commands, reachable with the mouse: while the picture has the keys, their
+    /// shortcuts go to the Host (DCritelli/sill#4).
+    private static func mainMenu() -> NSMenu {
+        let main = NSMenu()
+        let appItem = NSMenuItem()
+        main.addItem(appItem)
+        let appMenu = NSMenu(title: "Sill Client")
+        appMenu.addItem(withTitle: "Hide Sill Client", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Quit Sill Client", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+        let windowItem = NSMenuItem()
+        main.addItem(windowItem)
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowItem.submenu = windowMenu
+        NSApp.windowsMenu = windowMenu
+        return main
     }
 
     /// The hello (kind 23): this app's version and build, and the Mac as "computer name (model)",

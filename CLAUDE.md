@@ -4601,10 +4601,13 @@ good.
 - `Sources/SillClient/` — Sill Client, the Mac Client (docs/adr/0001–0003;
   bundled by `Scripts/make-client-app.sh`): `ClientSession` (one Host
   connection, AppKit-free, `Tests/checks/client-session`), `HostBrowser`,
-  `VideoView` (the picture where the translator puts it, the mouse and scrolling, the Host's
-  cursor shape through a cursor rect), `AppDelegate`, `InputTranslator` (the
-  spec's Seam 1: Mac-side happenings in, InputEvents and the picture's
-  rectangle out; pure, `Tests/checks/input-translator`), and
+  `VideoView` (the picture where the translator puts it, the mouse and scrolling, the keys
+  through a local event monitor while it is first responder, so ⌘-shortcuts go to the Host,
+  focus loss and the first click, the Host's cursor shape through a cursor rect), `AppDelegate`
+  (and a minimal main menu: Hide, Quit, Minimize, Close, reachable by mouse), `InputTranslator`
+  (the spec's Seam 1: Mac-side happenings in, InputEvents and the picture's rectangle out; key
+  codes to HID usages, the keypad as text, modifier keys as their own events; pure,
+  `Tests/checks/input-translator`), and
   `MessageReader.swift`, a symlink into iOSClient/ (ADR-0002).
 - `Packaging/` — Sill.app's `Info.plist` and the development entitlements
   (get-task-allow only), the release's (`SillRelease.entitlements`:
