@@ -13,7 +13,8 @@
 // Desktop: picked whatever the list), empty (a list with no Window: the Desktop), once (a second
 // list picks nothing more), video (parameter sets and frames reach the owner, keyframe flag and
 // bytes intact, in order), ping (a ping of 8 bytes within 1.5 s), hostclose (the Host closes:
-// onEnd once), stop (stop(): no onEnd, and the connection closes). Prints "ok" or "FAIL" per check;
+// onEnd once), input (sendInput(_:): each InputEvent one kind 8, in order), cursor (a cursor shape handed
+// on intact), stop (stop(): no onEnd, and the connection closes). Prints "ok" or "FAIL" per check;
 // exits 1 on any failure.
 import Foundation
 import Network
@@ -100,15 +101,17 @@ final class StandIn {
 /// What the session handed its owner, on its queue.
 final class Owner {
     private let lock = NSLock()
-    private var _lists = 0, _ends: [String] = [], _video: [String] = []
+    private var _lists = 0, _ends: [String] = [], _video: [String] = [], _cursors: [Data] = []
     var lists: Int { lock.lock(); defer { lock.unlock() }; return _lists }
     var ends: [String] { lock.lock(); defer { lock.unlock() }; return _ends }
     var video: [String] { lock.lock(); defer { lock.unlock() }; return _video }
+    var cursors: [Data] { lock.lock(); defer { lock.unlock() }; return _cursors }
 
     func attach(_ s: ClientSession) {
         s.onWindowList = { [self] _ in lock.lock(); _lists += 1; lock.unlock() }
         s.onParameterSets = { [self] ps in lock.lock(); _video.append("ps \(ps.nalUnitHeaderLength) \(ps.sets.count)"); lock.unlock() }
         s.onFrame = { [self] d, key in lock.lock(); _video.append("frame \(d.count) \(key) \(d.first ?? 0)"); lock.unlock() }
+        s.onCursorShape = { [self] d in lock.lock(); _cursors.append(d); lock.unlock() }
         s.onEnd = { [self] why in lock.lock(); _ends.append(why); lock.unlock() }
     }
 }
@@ -199,6 +202,25 @@ let cases: [(String, () -> Void)] = [
             host.send(.frame, Data([7]), keyframe: false)
             check(wait(2) { owner.video.count == 4 }, "video: everything reaches the owner")
             check(owner.video == ["ps 4 3", "frame 4 true 9", "frame 2 false 8", "frame 1 false 7"], "video: in order, intact, keyframe flag kept")
+        }
+    }),
+    ("input", {
+        withSession(pick: .firstWindow) { host, session, _ in
+            host.send(.windowList, Wire.encode(twoWindows))
+            wait(2) { kinds(host).contains(.viewport) }
+            let events: [InputEvent] = [.pointer(.leftDown, x: 0.25, y: 0.5), .pointer(.move, x: 0, y: 0.5), .pointer(.leftUp, x: 0, y: 0.5)]
+            session.sendInput(events)
+            check(wait(2) { kinds(host).count >= 6 }, "input: three input messages reach the stand-in")
+            let sent = host.received.filter { $0.0 == .input }.compactMap { Wire.decode(InputEvent.self, from: $0.1) }
+            check(sent == events, "input: each event as one kind 8, in order")
+        }
+    }),
+    ("cursor", {
+        withSession(pick: .firstWindow) { host, _, owner in
+            let blob = CursorShapeBlob.encode(hotspot: CGPoint(x: 4, y: 9), size: CGSize(width: 9, height: 18), png: Data([0x89, 1, 2]))
+            host.send(.cursorShape, blob)
+            check(wait(2) { !owner.cursors.isEmpty }, "cursor: the Host's cursor shape reaches the owner")
+            check(owner.cursors == [blob], "cursor: intact, once")
         }
     }),
     ("ping", {

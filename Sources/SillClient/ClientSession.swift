@@ -10,7 +10,8 @@ import StreamProtocol
 /// the Host's messages through the iOS app's MessageReader. The tracer's whole conversation: on the
 /// first Window list it picks the Source (the first Window, or the Desktop when asked for, or when
 /// the Host lists no Window) and sends it with the Viewport; it pings once a second; it hands the
-/// video to its owner. No pairing, no reconnect, no input yet (DCritelli/sill#2, #3, #9).
+/// video and the Host's cursor shape to its owner. Input goes out as the owner's input translator makes it
+/// (`sendInput`, DCritelli/sill#3). No pairing, no reconnect yet (DCritelli/sill#2, #9).
 ///
 /// Every callback runs on `queue`, one at a time; `start()` and `stop()` may be called from any
 /// thread. Foundation, Network and StreamProtocol only: checked with swiftc against a stand-in Host
@@ -25,6 +26,8 @@ final class ClientSession {
     var onWindowList: ((WindowList) -> Void)?
     var onParameterSets: ((ParameterSets) -> Void)?
     var onFrame: ((Data, Bool) -> Void)?
+    /// The Host's cursor shape (kind 14), a `CursorShapeBlob`, whenever it changes.
+    var onCursorShape: ((Data) -> Void)?
     /// Once, when the session ends by itself (never after `stop()`), with a line for the log.
     var onEnd: ((String) -> Void)?
 
@@ -98,6 +101,15 @@ final class ClientSession {
         }
     }
 
+    /// Sends what the input translator made, each event one kind 8, in order. From any thread.
+    func sendInput(_ events: [InputEvent]) {
+        guard !events.isEmpty else { return }
+        queue.async { [self] in
+            guard running else { return }
+            for event in events { send(.input, Wire.encode(event)) }
+        }
+    }
+
     private func end(_ why: String) {
         guard running else { return }
         running = false
@@ -116,8 +128,10 @@ final class ClientSession {
             if let sets = ParameterSets(encoded: payload) { onParameterSets?(sets) }
         case .frame:
             onFrame?(payload, header.isKeyframe)
+        case .cursorShape:
+            onCursorShape?(payload)
         default:
-            break   // pongs, ticks, thumbnails, icons, cursor shapes, settings: later tickets
+            break   // pongs, ticks, thumbnails, icons, settings: later tickets
         }
     }
 

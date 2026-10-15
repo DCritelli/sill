@@ -28,6 +28,9 @@ MUTANTS = {
         ("            guard running else { return }\n            running = false\n            pingTimer?.cancel()\n            connection.cancel()\n        }\n",
          "            guard running else { return }\n            end(\"stopped\")\n        }\n")],
     "C15 the list not handed on": [("            onWindowList?(list)\n", "")],
+    "C16 no cursor shape handed on": [("            onCursorShape?(payload)\n", "            break\n")],
+    "C17 only the first input sent": [("            for event in events { send(.input, Wire.encode(event)) }", "            send(.input, Wire.encode(events[0]))")],
+    "C18 input sent in reverse": [("            for event in events { send(.input, Wire.encode(event)) }", "            for event in events.reversed() { send(.input, Wire.encode(event)) }")],
     # Not a mutant here: dropping `end`'s own `guard running`. The session cancels its connection as
     # it ends, so no second end can arrive (the reader stops on `running`, a cancelled connection
     # reports .cancelled, which is ignored); the guard stays for a stack that does.

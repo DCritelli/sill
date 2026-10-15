@@ -52,6 +52,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         session.onParameterSets = { [video] in video.apply($0) }
         session.onFrame = { [video] in video.enqueue($0, isKeyframe: $1) }
+        session.onCursorShape = { [video] blob in DispatchQueue.main.async { video.setCursorShape(blob) } }
+        video.onInput = { [weak session] in session?.sendInput($0) }
         session.onEnd = { [weak self] why in
             print("Session ended: \(why)")
             DispatchQueue.main.async {

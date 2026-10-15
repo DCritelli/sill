@@ -7,8 +7,21 @@ import StreamProtocol
 /// HEVC in hardware itself. The same steps as the iOS app's HEVCDisplayView (format description from
 /// the parameter sets, one sample buffer per access unit, shown at once), without its pointer
 /// sprite: the Mac Client sets the local cursor instead (DCritelli/sill#3).
+///
+/// The mouse goes through the input translator (InputTranslator.swift), which also says where the
+/// picture is drawn, fitted with bars; the view only feeds it AppKit's events and hands on what it
+/// returns (`onInput`). Over the picture the cursor is the Host's shape, through a cursor rect, so
+/// AppKit swaps it as the pointer crosses the edge with nothing drawn by hand; elsewhere it is the
+/// arrow. Flipped, so its points run from the top left as the translator's do.
 final class VideoView: NSView {
+    /// What the translator made of a mouse event, in order. On main.
+    var onInput: (([InputEvent]) -> Void)?
+
     private let displayLayer = AVSampleBufferDisplayLayer()
+    /// On main.
+    private var translator = InputTranslator()
+    private var remoteCursor: NSCursor?
+    private var trackingArea: NSTrackingArea?
     /// Touched only on the session's queue (`apply`, `enqueue`), as the layer allows.
     private var formatDescription: CMVideoFormatDescription?
     private var lastParameterSets: Data?
@@ -18,12 +31,81 @@ final class VideoView: NSView {
         super.init(frame: frame)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
-        displayLayer.videoGravity = .resizeAspect
+        // The layer is given the translator's picture rectangle, so its own fit and the
+        // translator's agree whatever the layer would round.
+        displayLayer.videoGravity = .resize
         displayLayer.frame = bounds
-        displayLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
         layer?.addSublayer(displayLayer)
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    override var isFlipped: Bool { true }
+
+    override func layout() {
+        super.layout()
+        translator.contentSize = bounds.size
+        placePicture()
+    }
+
+    /// The layer where the translator says the picture goes, without an implicit animation, and the
+    /// cursor rect with it.
+    private func placePicture() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        displayLayer.frame = translator.pictureRect ?? bounds
+        CATransaction.commit()
+        window?.invalidateCursorRects(for: self)
+    }
+
+    /// The video's size, from its format: the picture is fitted to its aspect. On main.
+    private func setVideoSize(_ size: CGSize?) {
+        guard translator.frameSize != size else { return }
+        translator.frameSize = size
+        placePicture()
+    }
+
+    // MARK: The cursor
+
+    /// The Host's cursor shape (kind 14's CursorShapeBlob), shown over the picture. On main.
+    func setCursorShape(_ blob: Data) {
+        guard let shape = CursorShapeBlob.decode(blob), let image = NSImage(data: shape.png),
+              shape.size.width > 0, shape.size.height > 0 else { return }
+        image.size = shape.size   // the PNG is usually 2x: drawn at the Host's size in points
+        let cursor = NSCursor(image: image, hotSpot: shape.hotspot)
+        remoteCursor = cursor
+        window?.invalidateCursorRects(for: self)
+        // A cursor rect sets its cursor as the pointer enters it; one already inside gets the new
+        // shape now, not at its next crossing.
+        if let window, window.isKeyWindow, let rect = translator.pictureRect,
+           rect.contains(convert(window.mouseLocationOutsideOfEventStream, from: nil)) {
+            cursor.set()
+        }
+    }
+
+    override func resetCursorRects() {
+        if let rect = translator.pictureRect, let remoteCursor { addCursorRect(rect, cursor: remoteCursor) }
+    }
+
+    // MARK: The mouse
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect], owner: self)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    private func point(_ event: NSEvent) -> CGPoint { convert(event.locationInWindow, from: nil) }
+    private func hand(_ events: [InputEvent]) { if !events.isEmpty { onInput?(events) } }
+
+    override func mouseMoved(with event: NSEvent) { hand(translator.mouseMoved(to: point(event))) }
+    override func mouseDragged(with event: NSEvent) { hand(translator.mouseMoved(to: point(event))) }
+    override func rightMouseDragged(with event: NSEvent) { hand(translator.mouseMoved(to: point(event))) }
+    override func mouseDown(with event: NSEvent) { hand(translator.mouseDown(.left, at: point(event))) }
+    override func mouseUp(with event: NSEvent) { hand(translator.mouseUp(.left, at: point(event))) }
+    override func rightMouseDown(with event: NSEvent) { hand(translator.mouseDown(.right, at: point(event))) }
+    override func rightMouseUp(with event: NSEvent) { hand(translator.mouseUp(.right, at: point(event))) }
 
     /// A new format: the Host repeats its parameter sets with every keyframe, and only a real
     /// change (a new Source, a resize) needs a new description and a blank layer.
@@ -42,6 +124,9 @@ final class VideoView: NSView {
         formatDescription = desc
         waitingForKeyframe = true
         displayLayer.flushAndRemoveImage()
+        let dimensions = CMVideoFormatDescriptionGetDimensions(desc)
+        let size = CGSize(width: CGFloat(dimensions.width), height: CGFloat(dimensions.height))
+        DispatchQueue.main.async { [weak self] in self?.setVideoSize(size) }
     }
 
     func enqueue(_ data: Data, isKeyframe: Bool) {
@@ -87,6 +172,10 @@ final class VideoView: NSView {
         lastParameterSets = nil
         waitingForKeyframe = true
         displayLayer.flushAndRemoveImage()
+        DispatchQueue.main.async { [weak self] in
+            self?.setVideoSize(nil)
+            self?.remoteCursor = nil
+        }
     }
 
     private func withPointers<R>(to sets: [Data], _ body: ([UnsafePointer<UInt8>]) -> R) -> R {
