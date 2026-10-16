@@ -2,54 +2,233 @@ import AppKit
 import Network
 import StreamProtocol
 
-/// The tracer's app: one ordinary window that shows the first Host found on the home network with a
-/// plain door, and in it the first Window that Host lists. `-SillSource desktop` asks for the
-/// Desktop instead (for a `SillHost --synthetic`, whose pattern is the Desktop's); `-SillAddress
-/// host:port` dials a plain door by its address instead of browsing.
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var window: NSWindow!
+/// Sill Client's app: Connect to a Mac (the Hosts found on the network and the ones saved, Add a
+/// Mac…), and one stream window for the one Host connected (DCritelli/sill#2). Choosing another
+/// Host, or closing the stream window, goes back through Connect to a Mac.
+///
+/// Launch arguments for scripts and tests: `-SillSource desktop` asks for the Desktop instead of the
+/// first Window (a `SillHost --synthetic`, whose pattern is the Desktop's); `-SillAddress host:port`
+/// dials a plain door by its address; `-SillPairAddress host:port -SillPairCode <12 digits>` pairs at
+/// that address by code, then connects pinned; `-SillMemoryIdentity 1` keeps this Mac's key in
+/// memory for the run (ClientIdentity); `-Sill.savedMacs '[]'` starts with no saved Host for the run.
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    private let connectWindow = ConnectWindow()
+    private var model: ConnectModel { connectWindow.model }
+    private var streamWindow: NSWindow!
     private let video = VideoView(frame: NSRect(x: 0, y: 0, width: 960, height: 600))
     private let browser = HostBrowser()
+    private var found: [FoundHost] = []
+    /// The one Host connection.
     private var session: ClientSession?
+    private var pairing: ClientPairing?
+    /// Where the code typed next goes: the Host an ask reached, pinned to the key it answered with.
+    private var codeTarget: (endpoint: NWEndpoint, pin: Data, name: String)?
+    private var launched = false
+    private var pendingLinks: [URL] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        window = NSWindow(contentRect: video.frame, styleMask: [.titled, .closable, .miniaturizable, .resizable],
-                          backing: .buffered, defer: false)
-        window.title = "Looking for a Mac…"
-        window.contentView = video
-        window.makeFirstResponder(video)
+        streamWindow = NSWindow(contentRect: video.frame, styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                                backing: .buffered, defer: false)
+        streamWindow.isReleasedWhenClosed = false
+        streamWindow.contentView = video
+        streamWindow.delegate = self
         NSApp.mainMenu = Self.mainMenu()
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
 
-        // `-SillAddress host:port` dials that plain door without browsing (a Host whose Bonjour this
-        // Mac cannot see, or a script's).
-        if let address = UserDefaults.standard.string(forKey: "SillAddress"),
-           let colon = address.lastIndex(of: ":"), let port = NWEndpoint.Port(String(address[address.index(after: colon)...])) {
-            let host = String(address[..<colon]).trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-            connect(to: .hostPort(host: NWEndpoint.Host(host), port: port), name: address)
-            return
+        model.onConnect = { [weak self] in self?.connect($0) }
+        model.onForget = { [weak self] row in
+            guard case .saved(let mac, _) = row.kind else { return }
+            SavedHosts.forget(mac.macID)
+            self?.model.status = "\(mac.name) is forgotten. Pair with it again to connect."
+            self?.refreshRows()
         }
-        browser.onFound = { [weak self] endpoint, name in self?.connect(to: endpoint, name: name) }
+        model.onAddMac = { [weak self] in
+            self?.codeTarget = nil
+            self?.model.codeSheet = ConnectModel.CodeSheet(host: nil,
+                note: "On the Mac you want to add, choose Pair iPhone or iPad\u{2026} in the Sill menu, then enter the code it shows.")
+        }
+        model.onCode = { [weak self] code, host, address in self?.pairByCode(code, host: host, address: address) }
+        model.onCancelCode = { [weak self] in self?.codeTarget = nil }
+        browser.onChange = { [weak self] hosts in self?.found = hosts; self?.refreshRows() }
+        refreshRows()
+        connectWindow.show()
+        NSApp.activate(ignoringOtherApps: true)
         browser.start()
+        launched = true
+
+        let defaults = UserDefaults.standard
+        if let text = defaults.string(forKey: "SillPairAddress"), let endpoint = Self.endpoint(text),
+           let code = defaults.string(forKey: "SillPairCode") {
+            pair(.code(code), targets: [endpoint], pin: nil, name: text)
+        } else if let text = defaults.string(forKey: "SillAddress"), let endpoint = Self.endpoint(text) {
+            startSession(endpoint, parameters: ClientSession.plainParameters(), name: text, macID: nil)
+        }
+        pendingLinks.forEach(openLink)
+        pendingLinks = []
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) { session?.stop() }
 
-    private func connect(to endpoint: NWEndpoint, name: String) {
-        window.title = name
+    /// `sill://pair` links (CFBundleURLTypes), always behind a confirmation, as on the iOS app.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        if launched { urls.forEach(openLink) } else { pendingLinks += urls }
+    }
+
+    private func openLink(_ url: URL) {
+        guard case .success(let link) = PairLink.parse(url.absoluteString) else {
+            connectWindow.show()
+            model.status = "That link isn\u{2019}t a Sill pairing link."
+            return
+        }
+        connectWindow.show()
+        let alert = NSAlert()
+        alert.messageText = "Pair with \(link.name)?"
+        alert.informativeText = "Sill Client will pair this Mac with \(link.name), then connect to it."
+        alert.addButton(withTitle: "Pair")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        // The Host's rows on this network first (only its own key answers), then the link's addresses.
+        var targets = found.filter { $0.door != .plain }.map(\.endpoint)
+        targets += link.addresses.compactMap { a in
+            NWEndpoint.Port(rawValue: UInt16(clamping: a.port ?? link.port)).map { NWEndpoint.hostPort(host: NWEndpoint.Host(a.host), port: $0) }
+        }
+        pair(.link(link), targets: targets, pin: link.fingerprint, name: link.name, dialWait: 4)
+    }
+
+    // MARK: Connect to a Mac
+
+    private func refreshRows() {
+        model.rows = HostRow.rows(saved: SavedHosts.all, found: found)
+    }
+
+    private func connect(_ row: HostRow) {
+        model.status = nil
+        switch row.kind {
+        case .saved(let mac, let host):
+            guard let endpoint = host?.endpoint ?? ClientPairing.endpoint(of: mac), let pin = mac.fingerprintData else {
+                model.status = "\(mac.name) isn\u{2019}t on this network. Open Sill on it, then try again."
+                return
+            }
+            startSession(endpoint, parameters: pinned(pin), name: mac.name, macID: mac.macID, bonjourName: host?.name)
+        case .found(let host):
+            switch host.door {
+            case .plain: startSession(host.endpoint, parameters: ClientSession.plainParameters(), name: host.name, macID: nil)
+            case .open: startSession(host.endpoint, parameters: pinned(nil), name: host.name, macID: nil)
+            case .pairingRequired: ask(host)
+            }
+        }
+    }
+
+    private func pinned(_ pin: Data?) -> NWParameters {
+        guard let identity = ClientIdentity.loadOrCreate() else { return ClientSession.refusingParameters() }
+        return ClientSession.pinnedParameters(identity: identity, pin: pin)
+    }
+
+    /// An unpaired Host's row: ask it to show its code, then take the code pinned to the key that answered.
+    private func ask(_ host: FoundHost) {
+        guard let identity = ClientIdentity.loadOrCreate() else { model.status = Self.noIdentity; return }
+        model.working = true
+        model.status = "Asking \(host.name) for a code\u{2026}"
+        let p = makePairing(.ask, targets: [host.endpoint], pin: nil, name: host.name, identity: identity, dialWait: 10)
+        p.onDone = { [weak self] outcome in
+            DispatchQueue.main.async {
+                guard let self, self.pairing === p else { return }
+                self.pairing = nil
+                self.model.working = false
+                switch outcome {
+                case .asked(let reason, let fp, let endpoint):
+                    if reason == PairResult.locked { self.model.status = "Unlock \(host.name), then try again."; return }
+                    self.codeTarget = (endpoint, fp, host.name)
+                    self.model.status = nil
+                    let note = reason == PairResult.shown
+                        ? "Enter the code \(host.name) shows."
+                        : "On \(host.name), choose Pair iPhone or iPad\u{2026} in the Sill menu, then enter the code it shows."
+                    self.model.codeSheet = ConnectModel.CodeSheet(host: host.name, note: note)
+                case .failed(let words):
+                    self.model.status = words
+                case .paired:
+                    break   // an ask never pairs
+                }
+            }
+        }
+        p.start()
+    }
+
+    private func pairByCode(_ code: String, host: String?, address: String) {
+        if let target = codeTarget {
+            codeTarget = nil
+            pair(.code(code), targets: [target.endpoint], pin: target.pin, name: target.name)
+        } else if let host, let row = found.first(where: { $0.name == host }) {
+            pair(.code(code), targets: [row.endpoint], pin: nil, name: host)
+        } else if let endpoint = Self.endpoint(address) {
+            pair(.code(code), targets: [endpoint], pin: nil, name: address)
+        } else {
+            model.status = "That address isn\u{2019}t one Sill can dial. Type a name or an IP address, with its port if it has one."
+        }
+    }
+
+    private func pair(_ request: ClientPairing.Request, targets: [NWEndpoint], pin: Data?, name: String, dialWait: Double = 10) {
+        guard let identity = ClientIdentity.loadOrCreate() else { model.status = Self.noIdentity; return }
+        let method: String = { if case .link = request { return PairRequest.qr }; return PairRequest.code }()
+        model.working = true
+        model.status = "Pairing with \(name)\u{2026}"
+        let p = makePairing(request, targets: targets, pin: pin, name: name, identity: identity, dialWait: dialWait)
+        p.onDone = { [weak self] outcome in
+            DispatchQueue.main.async {
+                guard let self, self.pairing === p else { return }
+                self.pairing = nil
+                self.model.working = false
+                switch outcome {
+                case .paired(let host):
+                    SavedHosts.add(host.savedMac(method: method))
+                    self.refreshRows()
+                    self.model.status = "Paired with \(host.name)."
+                    print("Paired with \(host.name) (\(host.macID)), proof checked, pin saved")
+                    self.startSession(host.endpoint, parameters: ClientSession.pinnedParameters(identity: identity, pin: host.fingerprint),
+                                      name: host.name, macID: host.macID)
+                case .failed(let words):
+                    self.model.status = words
+                    print("Pairing with \(name) failed: \(words)")
+                case .asked:
+                    break
+                }
+            }
+        }
+        p.start()
+    }
+
+    private func makePairing(_ request: ClientPairing.Request, targets: [NWEndpoint], pin: Data?, name: String,
+                             identity: RemoteIdentity, dialWait: Double) -> ClientPairing {
+        pairing?.cancel()
+        let p = ClientPairing(targets: targets, pin: pin, request: request, macName: name, identity: identity,
+                              deviceName: Self.computerName, model: Self.model, dialWait: dialWait)
+        pairing = p
+        return p
+    }
+
+    // MARK: The one session
+
+    /// One Host at a time: whatever was connected is let go first.
+    private func startSession(_ endpoint: NWEndpoint, parameters: NWParameters, name: String, macID: String?, bonjourName: String? = nil) {
+        disconnect()
+        streamWindow.title = name
         let pick: ClientSession.Pick = UserDefaults.standard.string(forKey: "SillSource") == "desktop" ? .desktop : .firstWindow
         let size = video.bounds.size
-        let fps = window.screen?.maximumFramesPerSecond ?? 60
-        let session = ClientSession(endpoint: endpoint, parameters: ClientSession.plainParameters(), hello: Self.hello,
+        let fps = streamWindow.screen?.maximumFramesPerSecond ?? NSScreen.main?.maximumFramesPerSecond ?? 60
+        let session = ClientSession(endpoint: endpoint, parameters: parameters, hello: Self.hello,
                                     pick: pick, viewport: Viewport(width: size.width, height: size.height, scale: nil, fps: fps))
+        var first = true
         session.onWindowList = { [weak self] list in
             DispatchQueue.main.async {
-                guard let self, case .window(let id) = list.active, let shown = list.windows.first(where: { $0.id == id }) else { return }
-                self.window.title = "\(shown.title.isEmpty ? shown.appName : shown.title) — \(list.macName)"
+                guard let self, self.session === session else { return }
+                if first, let macID {
+                    first = false
+                    SavedHosts.connected(macID, bonjourName: bonjourName)
+                    self.refreshRows()
+                }
+                guard case .window(let id) = list.active, let shown = list.windows.first(where: { $0.id == id }) else { return }
+                self.streamWindow.title = "\(shown.title.isEmpty ? shown.appName : shown.title) — \(list.macName)"
             }
         }
         session.onParameterSets = { [video] in video.apply($0) }
@@ -59,14 +238,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         session.onEnd = { [weak self] why in
             print("Session ended: \(why)")
             DispatchQueue.main.async {
-                self?.video.clear()
-                self?.window.title = "\(name) — disconnected"
+                guard let self, self.session === session else { return }
+                self.video.clear()
+                self.streamWindow.title = "\(name) — disconnected"
+                self.model.status = "Disconnected from \(name)."
             }
         }
         self.session = session
         print("Connecting to \(name)")
+        streamWindow.makeKeyAndOrderFront(nil)
+        streamWindow.makeFirstResponder(video)
+        connectWindow.window.orderOut(nil)
         session.start()
     }
+
+    private func disconnect() {
+        session?.stop()
+        session = nil
+        video.onInput = nil
+        video.clear()
+    }
+
+    /// Back to Connect to a Mac: the session ends, the stream window goes.
+    @objc func showConnect(_ sender: Any?) {
+        disconnect()
+        streamWindow.orderOut(nil)
+        connectWindow.show()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard notification.object as? NSWindow === streamWindow else { return }
+        // Closing the stream window disconnects (the remote Window stays open on the Host).
+        disconnect()
+        connectWindow.show()
+    }
+
+    // MARK: Menus and names
 
     /// Sill Client's own commands, reachable with the mouse: while the picture has the keys, their
     /// shortcuts go to the Host (DCritelli/sill#4).
@@ -75,6 +282,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appItem = NSMenuItem()
         main.addItem(appItem)
         let appMenu = NSMenu(title: "Sill Client")
+        appMenu.addItem(withTitle: "Connect to a Mac\u{2026}", action: #selector(showConnect(_:)), keyEquivalent: "K")
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Hide Sill Client", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Quit Sill Client", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -89,18 +298,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return main
     }
 
-    /// The hello (kind 23): this app's version and build, and the Mac as "computer name (model)",
-    /// the shape the iOS app gives its device.
-    static let hello: Hello = {
-        let info = Bundle.main.infoDictionary
-        let name = Host.current().localizedName ?? "Mac"
+    private static let noIdentity = "Sill Client couldn\u{2019}t make its key in the keychain, so it can\u{2019}t pair. The log says why."
+
+    /// "host:port", "[v6]:port", or a name or address alone (the remote door's port, 7455).
+    static func endpoint(_ text: String) -> NWEndpoint? {
+        guard case .success(let a) = AddressParser.parse(text.trimmingCharacters(in: .whitespaces)),
+              let port = NWEndpoint.Port(rawValue: UInt16(clamping: a.port ?? ClientPairing.defaultRemotePort)) else { return nil }
+        return .hostPort(host: NWEndpoint.Host(a.host), port: port)
+    }
+
+    /// This Mac's computer name: how the Host's paired-device list names it.
+    static let computerName = Host.current().localizedName ?? "Mac"
+
+    /// "Mac14,9".
+    static let model: String? = {
         var size = 0
         sysctlbyname("hw.model", nil, &size, nil, 0)
         var model = [CChar](repeating: 0, count: max(size, 1))
         sysctlbyname("hw.model", &model, &size, nil, 0)
         let id = String(cString: model)
+        return id.isEmpty ? nil : id
+    }()
+
+    /// The hello (kind 23): this app's version and build, and the Mac as "computer name (model)",
+    /// the shape the iOS app gives its device.
+    static let hello: Hello = {
+        let info = Bundle.main.infoDictionary
         return Hello(appVersion: info?["CFBundleShortVersionString"] as? String ?? "0.0",
                      build: info?["CFBundleVersion"] as? String, protocol: SillProtocol.current,
-                     device: id.isEmpty ? name : "\(name) (\(id))")
+                     device: model.map { "\(computerName) (\($0))" } ?? computerName)
     }()
 }

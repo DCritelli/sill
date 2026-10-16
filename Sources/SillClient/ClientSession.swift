@@ -11,7 +11,8 @@ import StreamProtocol
 /// first Window list it picks the Source (the first Window, or the Desktop when asked for, or when
 /// the Host lists no Window) and sends it with the Viewport; it pings once a second; it hands the
 /// video and the Host's cursor shape to its owner. Input goes out as the owner's input translator makes it
-/// (`sendInput`, DCritelli/sill#3). No pairing, no reconnect yet (DCritelli/sill#2, #9).
+/// (`sendInput`, DCritelli/sill#3). A plain door (`plainParameters`) or a TLS one pinned to the
+/// Host's key (`pinnedParameters`, after ClientPairing, DCritelli/sill#2). No reconnect yet (#9).
 ///
 /// Every callback runs on `queue`, one at a time; `start()` and `stop()` may be called from any
 /// thread. Foundation, Network and StreamProtocol only: checked with swiftc against a stand-in Host
@@ -61,6 +62,31 @@ final class ClientSession {
         params.serviceClass = .interactiveVideo
         return params
     }
+
+    /// A TLS home door's parameters (DCritelli/sill#2), as the iOS app dials a saved Mac: mutual
+    /// TLS 1.3 with this Mac's key (RemoteTLS), ALPN `sill/1`, the Host's key checked against
+    /// `pin`, or any P-256 key where there is none (an open door, Require pairing off); TCP without
+    /// Nagle and the interactive video class.
+    static func pinnedParameters(identity: RemoteIdentity, pin: Data?) -> NWParameters {
+        let tls = RemoteTLS.options(identity: identity.tls, role: .client(alpn: RemoteTLS.sessionALPN), verify: { fp in
+            guard let pin else { return fp != nil }
+            return fp == pin
+        }, queue: verifyQueue)
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        return RemoteTLS.parameters(tls: tls, tcp: tcp, peerToPeer: false)
+    }
+
+    /// Parameters that never connect (TLS trusting no key): for a pinned dial should this Mac's own
+    /// key be unreadable, so nothing ever goes out in plain.
+    static func refusingParameters() -> NWParameters {
+        let tls = NWProtocolTLS.Options()
+        sec_protocol_options_set_verify_block(tls.securityProtocolOptions, { _, _, complete in complete(false) }, verifyQueue)
+        return RemoteTLS.parameters(tls: tls, tcp: NWProtocolTCP.Options(), peerToPeer: false)
+    }
+
+    /// Where every session's pin is checked: it answers at once, never waiting on anything.
+    private static let verifyQueue = DispatchQueue(label: "sill.client.verify")
 
     func start() {
         queue.async { [self] in
