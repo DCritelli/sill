@@ -33,6 +33,9 @@ final class ClientSession {
     var onHostMaxFPS: ((Int) -> Void)?
     /// The Source the session picked, once, right after it sent the pick (#6).
     var onPicked: ((StreamSource) -> Void)?
+    /// A Window's thumbnail (kind 3, an `ImageBlob`) and an app's icon (kind 4), as they arrive (#7).
+    var onThumbnail: ((Data) -> Void)?
+    var onIcon: ((Data) -> Void)?
     /// Once, when the session ends by itself (never after `stop()`), with a line for the log.
     var onEnd: ((String) -> Void)?
 
@@ -139,6 +142,22 @@ final class ClientSession {
         }
     }
 
+    /// Makes a Window or the Desktop the Source (a click in the Bar; #7). From any thread.
+    func sendSource(_ source: StreamSource) {
+        queue.async { [self] in
+            guard running else { return }
+            send(.selectSource, Wire.encode(source))
+        }
+    }
+
+    /// Asks the Host to close, minimize or full-screen one of its Windows (#7). From any thread.
+    func sendWindowCommand(_ command: WindowCommand) {
+        queue.async { [self] in
+            guard running else { return }
+            send(.windowCommand, Wire.encode(command))
+        }
+    }
+
     /// Sends what the input translator made, each event one kind 8, in order. From any thread.
     func sendInput(_ events: [InputEvent]) {
         guard !events.isEmpty else { return }
@@ -168,6 +187,10 @@ final class ClientSession {
             onFrame?(payload, header.isKeyframe)
         case .cursorShape:
             onCursorShape?(payload)
+        case .thumbnail:
+            onThumbnail?(payload)
+        case .appIcon:
+            onIcon?(payload)
         case .hostSettings:
             if let state = Wire.decode(HostSettingsState.self, from: payload) { onHostMaxFPS?(state.settings.maxFPS) }
         default:

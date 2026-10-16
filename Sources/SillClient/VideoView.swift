@@ -32,6 +32,8 @@ final class VideoView: NSView {
     /// The local monitor that takes the keys while this view has them, and the key-window observer.
     private var keyMonitor: Any?
     private var resignObserver: NSObjectProtocol?
+    /// The key code of a shortcut kept local, whose up is kept local too.
+    private var localKeyCode: UInt16?
     /// The event number of the click AppKit asked about in `acceptsFirstMouse`: the one that brings
     /// the window forward.
     private var firstMouseNumber: Int?
@@ -67,6 +69,17 @@ final class VideoView: NSView {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
             guard let self, let window = self.window, event.window === window, window.isKeyWindow,
                   window.firstResponder === self else { return event }
+            // Sill Client's own View › Hide Bar (⌃⌘B) is the one shortcut that stays local (#7).
+            if event.type == .keyDown, event.modifierFlags.intersection([.control, .command, .option, .shift]) == [.control, .command],
+               event.charactersIgnoringModifiers?.lowercased() == "b" {
+                self.localKeyCode = event.keyCode
+                NSApp.mainMenu?.performKeyEquivalent(with: event)
+                return nil
+            }
+            if event.type == .keyUp, self.localKeyCode == event.keyCode {
+                self.localKeyCode = nil
+                return nil
+            }
             self.key(event)
             return nil
         }

@@ -19,6 +19,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// What to ask the Host for as the window resizes and moves (DCritelli/sill#6); on main.
     private var viewports = ViewportPolicy()
     private var viewportTimer: Timer?
+    private lazy var container = StreamContainerView(video: video)
+    /// The Bar's state for the Host connected (DCritelli/sill#7); on main.
+    private var bar = BarModel()
+    /// Where the stream window was left, for each Host (UserDefaults "SillFrames").
+    private var frames = FrameMemory(data: UserDefaults.standard.data(forKey: "SillFrames") ?? Data())
+    private var frameKey: String?
     private let browser = HostBrowser()
     private var found: [FoundHost] = []
     /// The one Host connection.
@@ -33,7 +39,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         streamWindow = NSWindow(contentRect: video.frame, styleMask: [.titled, .closable, .miniaturizable, .resizable],
                                 backing: .buffered, defer: false)
         streamWindow.isReleasedWhenClosed = false
-        streamWindow.contentView = video
+        streamWindow.contentView = container
+        container.bar.onSelect = { [weak self] source in self?.session?.sendSource(source) }
+        container.bar.onCommand = { [weak self] action, id in self?.session?.sendWindowCommand(WindowCommand(id: id, action: action)) }
         streamWindow.collectionBehavior.insert(.fullScreenPrimary)
         streamWindow.delegate = self
         video.onContentSize = { [weak self] size in
@@ -221,6 +229,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func startSession(_ endpoint: NWEndpoint, parameters: NWParameters, name: String, macID: String?, bonjourName: String? = nil) {
         disconnect()
         streamWindow.title = name
+        bar = BarModel()
+        container.bar.update(bar)
+        frameKey = FrameMemory.key(macID: macID, name: name)
+        if let remembered = frames.frame(for: frameKey!), !streamWindow.isVisible {
+            streamWindow.setFrame(streamWindow.constrainFrameRect(remembered, to: streamWindow.screen ?? NSScreen.main), display: false)
+        }
         let pick: ClientSession.Pick = UserDefaults.standard.string(forKey: "SillSource") == "desktop" ? .desktop : .firstWindow
         let size = video.bounds.size
         let fps = streamWindow.screen?.maximumFramesPerSecond ?? NSScreen.main?.maximumFramesPerSecond ?? 60
@@ -240,8 +254,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     SavedHosts.connected(macID, bonjourName: bonjourName)
                     self.refreshRows()
                 }
-                guard case .window(let id) = list.active, let shown = list.windows.first(where: { $0.id == id }) else { return }
-                self.streamWindow.title = "\(shown.title.isEmpty ? shown.appName : shown.title) — \(list.macName)"
+                self.bar.windowListReceived(list)
+                self.container.bar.update(self.bar)
+                self.streamWindow.title = self.bar.windowTitle
+                let kind: ViewportPolicy.SourceKind = self.bar.desktopActive ? .desktop : .window
+                if kind != self.viewports.sourceKind {
+                    self.sendViewport(self.viewports.sourceChanged(kind, now: Self.now))
+                }
+            }
+        }
+        session.onThumbnail = { [weak self] blob in
+            DispatchQueue.main.async {
+                guard let self, self.session === session else { return }
+                self.bar.thumbnailReceived(blob)
+                self.container.bar.update(self.bar)
+            }
+        }
+        session.onIcon = { [weak self] blob in
+            DispatchQueue.main.async {
+                guard let self, self.session === session else { return }
+                self.bar.iconReceived(blob)
+                self.container.bar.update(self.bar)
             }
         }
         session.onParameterSets = { [video] in video.apply($0) }
@@ -286,12 +319,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowDidEndLiveResize(_ notification: Notification) {
+        rememberFrame()
         sendViewport(viewports.resizeEnded(now: Self.now))
     }
 
+    func windowWillEnterFullScreen(_ notification: Notification) { container.setFullScreen(true) }
     func windowDidEnterFullScreen(_ notification: Notification) {
         sendViewport(viewports.resizeEnded(now: Self.now))
     }
+
+    func windowWillExitFullScreen(_ notification: Notification) { container.setFullScreen(false) }
 
     func windowDidExitFullScreen(_ notification: Notification) {
         sendViewport(viewports.resizeEnded(now: Self.now))
@@ -303,7 +340,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sendViewport(viewports.displayChanged(maxFPS: fps, now: Self.now))
     }
 
+    private func rememberFrame() {
+        guard let key = frameKey, streamWindow.isVisible, !streamWindow.styleMask.contains(.fullScreen) else { return }
+        frames.remember(streamWindow.frame, for: key)
+        UserDefaults.standard.set(frames.data, forKey: "SillFrames")
+    }
+
+    func windowDidMove(_ notification: Notification) { rememberFrame() }
+
+    @objc func toggleBar(_ sender: NSMenuItem) {
+        container.toggleBar()
+        sender.title = container.visibility.menuTitle
+    }
+
     private func disconnect() {
+        rememberFrame()
         session?.stop()
         session = nil
         video.onInput = nil
@@ -339,6 +390,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Quit Sill Client", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
+        let viewItem = NSMenuItem()
+        main.addItem(viewItem)
+        let viewMenu = NSMenu(title: "View")
+        let hideBar = NSMenuItem(title: "Hide Bar", action: #selector(toggleBar(_:)), keyEquivalent: "b")
+        hideBar.keyEquivalentModifierMask = [.control, .command]
+        viewMenu.addItem(hideBar)
+        viewItem.submenu = viewMenu
         let windowItem = NSMenuItem()
         main.addItem(windowItem)
         let windowMenu = NSMenu(title: "Window")
