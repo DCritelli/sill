@@ -1,23 +1,42 @@
-// The client-session check (DCritelli/sill#10): the Mac Client's ClientSession
-// (Sources/SillClient/ClientSession.swift) with the iOS app's MessageReader and StreamProtocol,
-// against a stand-in Host on loopback. Each case has a fresh listener; the stand-in records every
-// message the session sends, in order, and writes what the case says.
+// The client-session check (DCritelli/sill#10, #2): the Mac Client's ClientSession and ClientPairing
+// (Sources/SillClient) with the iOS app's MessageReader and SavedMacs and StreamProtocol, against a
+// stand-in Host on loopback: plain, or a TLS 1.3 home door with Require pairing on (`Door`). Each case
+// has a fresh listener; the stand-in records every message the session sends, in order, and writes
+// what the case says. run.sh compiles it (SavedMacs.swift without its `import StreamProtocol`):
+//   Tests/checks/client-session/run.sh [CASE...]
 //
-//   swiftc Sources/SillClient/ClientSession.swift iOSClient/MessageReader.swift Sources/StreamProtocol/*.swift \
-//     Tests/checks/client-session/main.swift -o .build/checks/client-session/check
-//   .build/checks/client-session/check [CASE...]
+// Pairing cases: paircode (the right code pairs over sill-pair/1 with TLS 1.3: one kind 19 with this
+// Mac's name and model, proof_D bound to the keys of that TLS session; the Host's Mac ID, key, name and
+// recognition key; the saved record in SavedMacs' format, `homeTLS`, the address it paired at; then a
+// session pinned to the Host's key, mutual TLS 1.3 on sill/1, the hello first), bonjour (a Host paired
+// on its row is saved and dialed by its service name), busy (a busy Host is tried again, silently,
+// a bounded number of times), wrongcode (the tries left, nothing paired), expired, refusals (closed,
+// stopped, a reason this build does not know: the Host's own words), typo (caught here: the Host never
+// hears of it), proofs (a Host that can't prove the code, or names another key's Mac ID, is not saved),
+// pins (a session pinned to another key, or from an unpaired key, ends with nothing said; a link for
+// another key sends no proof), link (a sill://pair link pairs, method qr), targets (a dead target is
+// passed by), ask (method ask, no proof; the answer and the key to pin the code to).
 //
-// Cases: first (the hello is the first message, with its version and device; on a list of two
+// Session cases: first (the hello is the first message, with its version and device; on a list of two
 // Windows the first is picked; the Viewport follows the pick, as given), eager (the Host's list sent
 // the moment the connection is up, as a real Host sends it: the hello still goes first), desktop (asked for the
 // Desktop: picked whatever the list), empty (a list with no Window: the Desktop), once (a second
 // list picks nothing more), video (parameter sets and frames reach the owner, keyframe flag and
 // bytes intact, in order), ping (a ping of 8 bytes within 1.5 s), hostclose (the Host closes:
 // onEnd once), input (sendInput(_:): each InputEvent one kind 8, in order), cursor (a cursor shape handed
-// on intact), stop (stop(): no onEnd, and the connection closes). Prints "ok" or "FAIL" per check;
+// on intact), stop (stop(): no onEnd, and the connection closes).
+//
+// Reconnect cases (DCritelli/sill#9, ClientConnection with GoodbyePolicy): redial (the Host drops with
+// no goodbye: reconnecting, then dialed again where it is now, hello first, and the Source the user
+// had resumed), resumedesktop, resumegone (the Window is gone: the Desktop), quitgoodbye (a goodbye
+// that allows it redials), noticeredial (a notice with reconnect true redials), removed / update /
+// notice (a goodbye without reconnect: stopped with the Host's reason, the App Store offered for
+// update, never dialed again), neverup (a Host that never answered is not dialed again), giveup (a
+// bounded number of attempts), stopquiet (stop(): no state, no redial). Prints "ok" or "FAIL" per check;
 // exits 1 on any failure.
 import Foundation
 import Network
+import CryptoKit
 
 var failures = 0
 func check(_ ok: Bool, _ what: String) {
@@ -50,15 +69,28 @@ final class StandIn {
 
     /// - `eager`: a message to send the moment the connection is up, before reading anything, as a
     ///   real Host sends its Window list on connect.
-    init(eager: Data? = nil) {
-        listener = try! NWListener(using: .tcp, on: .any)
+    /// - `door`: a TLS home door with Require pairing on (`sill/1` for paired keys, `sill-pair/1`
+    ///   for pairing) instead of plain TCP.
+    let door: Door?
+    init(eager: Data? = nil, door: Door? = nil) {
+        self.door = door
+        let tlsQueue = DispatchQueue(label: "standin.tls")
+        let params: NWParameters = door.map { d in
+            RemoteTLS.parameters(tls: RemoteTLS.options(identity: d.identity.tls, role: .server, queue: tlsQueue) { fp, alpn in
+                guard let fp else { return false }
+                return alpn == RemoteTLS.pairingALPN ? d.pairingOpen : (alpn == RemoteTLS.sessionALPN && d.isPaired(fp))
+            }, dialing: false)
+        } ?? .tcp
+        listener = try! NWListener(using: params, on: .any)
         let ready = DispatchSemaphore(value: 0)
         listener.stateUpdateHandler = { if case .ready = $0 { ready.signal() } }
         listener.newConnectionHandler = { [self] c in
-            connection = c
             c.stateUpdateHandler = { [self] state in
                 switch state {
                 case .ready:
+                    if let door { door.connected(c) }
+                    if RemoteTLS.negotiatedALPN(c) == RemoteTLS.pairingALPN { door?.pair(c); return }
+                    connection = c
                     if let eager { c.send(content: eager, completion: .contentProcessed { _ in }) }
                     readHeader(c)
                 case .failed, .cancelled: lock.lock(); _closed = true; lock.unlock()
@@ -98,6 +130,79 @@ final class StandIn {
     func stop() { connection?.cancel(); listener.cancel() }
 }
 
+/// A stand-in Host's TLS door at home with Require pairing on: its own key, the keys it paired, and
+/// how it answers a kind 19 (as a Host does, docs/home-pairing-plan.md §3.1): a proof made with the
+/// window's key pairs that device (proof_M, the Mac ID, the name, the recognition key) and anything
+/// else is refused with `code` and the tries left; `answer` overrides that.
+final class Door {
+    enum Answer { case honest, refuse(PairResult), badProof, wrongMacID, shown, busyOnce }
+    let identity = RemoteIdentity(privateKey: RemoteKey.generate()!)!
+    let name = "Stand-in Mac"
+    let recognitionKey = Data(repeating: 7, count: 32)
+    var macID: String { MacID.make(fingerprint: identity.fingerprint) }
+    /// The window's key: the typed code's PBKDF2 key, or a link's secret.
+    var windowKey: SymmetricKey?
+    var answer: Answer = .honest
+    var pairingOpen = true
+    private let lock = NSLock()
+    private var _paired: Set<Data> = []
+    private var _requests: [(PairRequest, Data?)] = []
+    private var _versions: [tls_protocol_version_t] = []
+    /// Each kind 19 read, with the device's key as the TLS session showed it.
+    var requests: [(PairRequest, Data?)] { lock.lock(); defer { lock.unlock() }; return _requests }
+    /// The TLS version of every connection that came up.
+    var versions: [tls_protocol_version_t] { lock.lock(); defer { lock.unlock() }; return _versions }
+    func isPaired(_ fp: Data) -> Bool { lock.lock(); defer { lock.unlock() }; return _paired.contains(fp) }
+    func addPaired(_ fp: Data) { lock.lock(); _paired.insert(fp); lock.unlock() }
+
+    init(code: String? = nil, secret: Data? = nil) {
+        if let code { windowKey = PairingProof.codeKey(code: code, macFingerprint: identity.fingerprint) }
+        if let secret { windowKey = PairingProof.qrKey(secret: secret) }
+    }
+
+    func connected(_ c: NWConnection) {
+        guard let m = c.metadata(definition: NWProtocolTLS.definition) as? NWProtocolTLS.Metadata else { return }
+        let v = sec_protocol_metadata_get_negotiated_tls_protocol_version(m.securityProtocolMetadata)
+        lock.lock(); _versions.append(v); lock.unlock()
+    }
+
+    /// One pairing connection: one kind 19 in, one kind 20 out, then closed.
+    func pair(_ c: NWConnection) {
+        c.receive(minimumIncompleteLength: StreamMessage.headerLength, maximumLength: StreamMessage.headerLength) { [self] data, _, _, _ in
+            guard let data, let header = StreamMessage.parseHeader(data), header.kind == .pairRequest, header.payloadLength > 0 else { c.cancel(); return }
+            c.receive(minimumIncompleteLength: header.payloadLength, maximumLength: header.payloadLength) { [self] body, _, _, _ in
+                guard let body, let request = Wire.decode(PairRequest.self, from: body) else { c.cancel(); return }
+                let device = RemoteTLS.peerFingerprint(c)
+                lock.lock(); _requests.append((request, device)); lock.unlock()
+                let result = answer(to: request, device: device)
+                let m = StreamMessage(kind: .pairResult, timestamp: 1, isKeyframe: false, payload: Wire.encode(result))
+                c.send(content: m.serialized(), completion: .contentProcessed { _ in c.cancel() })
+            }
+        }
+    }
+
+    private func answer(to request: PairRequest, device: Data?) -> PairResult {
+        let mine = identity.fingerprint
+        if case .refuse(let r) = answer { return r }
+        if case .shown = answer { return PairResult(ok: false, reason: PairResult.shown) }
+        if case .busyOnce = answer {
+            // As a Host right after a wrong code: busy for a moment, then it takes a proof again.
+            answer = .honest
+            return PairResult(ok: false, reason: PairResult.busy, retryAfter: 0.3)
+        }
+        guard request.method != PairRequest.ask else { return PairResult(ok: false, reason: PairResult.openOnMac) }
+        guard let device, let key = windowKey, let proof = Base64URL.decode(request.proof),
+              PairingProof.isValidDeviceProof(proof, key: key, deviceFingerprint: device, macFingerprint: mine) else {
+            return PairResult(ok: false, reason: PairResult.code, triesLeft: 4)
+        }
+        addPaired(device)
+        var proofM = PairingProof.macProof(key: key, macFingerprint: mine, deviceFingerprint: device)
+        if case .badProof = answer { proofM[0] ^= 1 }
+        let id: String = { if case .wrongMacID = answer { return MacID.make(fingerprint: Data(repeating: 1, count: 32)) }; return macID }()
+        return PairResult(ok: true, proof: Base64URL.encode(proofM), macID: id, name: name, recognitionKey: Base64URL.encode(recognitionKey))
+    }
+}
+
 /// What the session handed its owner, on its queue.
 final class Owner {
     private let lock = NSLock()
@@ -126,13 +231,18 @@ let twoWindows = WindowList(macName: "Stand-in", windows: [
 /// A session to a fresh stand-in, connected; the case runs, then both are torn down.
 func withSession(pick: ClientSession.Pick, eager: Data? = nil, _ body: (StandIn, ClientSession, Owner) -> Void) {
     let host = StandIn(eager: eager)
+    withSession(to: host, parameters: ClientSession.plainParameters(), pick: pick, body)
+}
+
+func withSession(to host: StandIn, parameters: NWParameters, pick: ClientSession.Pick = .firstWindow,
+                 expectReach: Bool = true, _ body: (StandIn, ClientSession, Owner) -> Void) {
     let session = ClientSession(endpoint: .hostPort(host: "127.0.0.1", port: host.port),
-                                parameters: ClientSession.plainParameters(), hello: hello, pick: pick, viewport: viewport)
+                                parameters: parameters, hello: hello, pick: pick, viewport: viewport)
     let owner = Owner()
     owner.attach(session)
     session.start()
     // The stand-in's connection exists once it has read something: the hello, first of all.
-    if !wait(2, { !host.received.isEmpty }) { check(false, "the session reaches the stand-in") }
+    if expectReach, !wait(2, { !host.received.isEmpty }) { check(false, "the session reaches the stand-in") }
     body(host, session, owner)
     session.stop()
     host.stop()
@@ -140,15 +250,223 @@ func withSession(pick: ClientSession.Pick, eager: Data? = nil, _ body: (StandIn,
 
 func kinds(_ host: StandIn) -> [StreamMessageKind] { host.received.map(\.0).filter { $0 != .ping } }
 
+// MARK: Pairing (DCritelli/sill#2)
+
+/// This Mac's key, as the Mac Client's identity store would give it: in memory here.
+let device = RemoteIdentity(privateKey: RemoteKey.generate()!)!
+
+/// A fresh valid code (its check digit right).
+func freshCode() -> String { PairingCode.generate()! }
+
+/// One pairing against `host`, waited for (PBKDF2 takes a moment): its outcome, or nil after 20 s.
+func pair(_ host: StandIn, _ request: ClientPairing.Request, pin: Data? = nil, targets: [NWEndpoint]? = nil) -> ClientPairing.Outcome? {
+    let p = ClientPairing(targets: targets ?? [.hostPort(host: "127.0.0.1", port: host.port)], pin: pin, request: request,
+                          macName: "Stand-in Mac", identity: device, deviceName: "Check Mac", model: "Mac0,0", dialWait: 2)
+    let lock = NSLock()
+    var outcome: ClientPairing.Outcome?
+    p.onDone = { o in lock.lock(); outcome = o; lock.unlock() }
+    p.start()
+    wait(20) { lock.lock(); defer { lock.unlock() }; return outcome != nil }
+    lock.lock(); defer { lock.unlock() }
+    return outcome
+}
+
+func paired(_ o: ClientPairing.Outcome?) -> ClientPairing.PairedHost? { if case .paired(let h)? = o { return h }; return nil }
+func words(_ o: ClientPairing.Outcome?) -> String? { if case .failed(let w)? = o { return w }; return nil }
+
 let cases: [(String, () -> Void)] = [
+    ("paircode", {
+        let code = freshCode()
+        let door = Door(code: code)
+        let host = StandIn(door: door)
+        let o = pair(host, .code(PairingCode.grouped(code)))
+        let h = paired(o)
+        check(h != nil, "paircode: the right code pairs (\(String(describing: o)))")
+        check(door.requests.count == 1, "paircode: one kind 19")
+        let r = door.requests.first
+        check(r?.0.method == PairRequest.code && r?.0.name == "Check Mac" && r?.0.model == "Mac0,0",
+              "paircode: method code, with this Mac's name and model")
+        check(r?.1 == device.fingerprint, "paircode: the Host saw this Mac's own key in the TLS session")
+        check(door.isPaired(device.fingerprint), "paircode: the stand-in took the proof")
+        check(!door.versions.isEmpty && door.versions.allSatisfy { $0 == .TLSv13 }, "paircode: TLS 1.3")
+        check(h?.macID == door.macID && h?.fingerprint == door.identity.fingerprint, "paircode: the Host's Mac ID and key, from the TLS session")
+        check(h?.name == "Stand-in Mac" && h?.recognitionKey == Base64URL.encode(door.recognitionKey), "paircode: its name and recognition key")
+        guard let h else { host.stop(); return }
+        // The record, in the format the iOS app saves (SavedMacs), survives its own storage.
+        let saved = SavedMacs.decode(SavedMacs.encode([h.savedMac(method: PairRequest.code)]))
+        check(saved.count == 1 && saved.first?.macID == door.macID && saved.first?.fingerprintData == door.identity.fingerprint,
+              "paircode: the saved record decodes, pinned to the Host's key")
+        check(saved.first?.homeTLS == true && saved.first?.method == "code", "paircode: saved as paired by code at a TLS door")
+        check(saved.first?.typedAddresses?.first?.host == "127.0.0.1" && saved.first?.typedAddresses?.first?.port == Int(host.port.rawValue),
+              "paircode: an address it was paired at is kept to dial it again")
+        check(saved.first.flatMap(ClientPairing.endpoint(of:)) == .hostPort(host: "127.0.0.1", port: host.port),
+              "paircode: a saved Host is dialed where it paired")
+        // Later connections: mutual TLS 1.3 pinned to the Host's key, sill/1, the hello first.
+        withSession(to: host, parameters: ClientSession.pinnedParameters(identity: device, pin: h.fingerprint)) { host, _, _ in
+            check(host.received.first?.0 == .hello, "paircode: pinned session: the hello is the first message")
+            host.send(.windowList, Wire.encode(twoWindows))
+            check(wait(2) { kinds(host).contains(.viewport) }, "paircode: pinned session: the pick and the Viewport")
+        }
+        check(door.versions.count >= 2 && door.versions.allSatisfy { $0 == .TLSv13 }, "paircode: the session is TLS 1.3 too")
+        host.stop()
+    }),
+    ("bonjour", {
+        // A Host paired on its Bonjour row is dialed by that service name again.
+        let code = freshCode()
+        let door = Door(code: code)
+        let host = StandIn(door: door)
+        let row = NWEndpoint.service(name: "Stand-in Mac", type: "_sill._tcp", domain: "local.", interface: nil)
+        let h = paired(pair(host, .code(code)))
+        let mac = h.map { var h = $0; h.endpoint = row; return h.savedMac(method: PairRequest.code) }
+        check(mac?.bonjourName == "Stand-in Mac" && mac?.typedAddresses == nil, "bonjour: the row's service name is saved, no address")
+        check(mac.flatMap(ClientPairing.endpoint(of:)) == row, "bonjour: dialed by that name")
+        host.stop()
+    }),
+    ("wrongcode", {
+        let door = Door(code: freshCode())
+        let host = StandIn(door: door)
+        var other = freshCode()
+        while PairingProof.codeKey(code: other, macFingerprint: door.identity.fingerprint) == door.windowKey { other = freshCode() }
+        let o = pair(host, .code(other))
+        check(paired(o) == nil, "wrongcode: not paired")
+        check(words(o)?.contains("4\u{00A0}tries left") == true && words(o)?.contains("didn’t work") == true,
+              "wrongcode: says the code didn't work and the tries left (\(words(o) ?? "nil"))")
+        check(!door.isPaired(device.fingerprint), "wrongcode: the stand-in paired nothing")
+        host.stop()
+    }),
+    ("busy", {
+        // A Host busy for a moment (right after a wrong code: its back-off, then its 5 s between one
+        // source's proofs) is tried again, silently, a few times.
+        let code = freshCode()
+        let door = Door(code: code)
+        door.answer = .busyOnce
+        let host = StandIn(door: door)
+        let o = pair(host, .code(code))
+        check(paired(o)?.macID == door.macID, "busy: paired on the second try (\(String(describing: o)))")
+        check(door.requests.count == 2, "busy: two kinds 19, one connection each")
+        door.answer = .refuse(PairResult(ok: false, reason: PairResult.busy, retryAfter: 0.1))
+        check(words(pair(host, .code(code)))?.contains("busy") == true, "busy: busy every time: said, not retried for ever")
+        check(door.requests.count == 2 + 1 + ClientPairing.busyRetries, "busy: \(ClientPairing.busyRetries) retries, no more (\(door.requests.count - 2))")
+        check(ClientPairing.busyRetries >= 2, "busy: at least two retries (a real Host's back-off, then its spacing)")
+        host.stop()
+    }),
+    ("expired", {
+        let door = Door(code: freshCode())
+        door.answer = .refuse(PairResult(ok: false, reason: PairResult.expired))
+        let host = StandIn(door: door)
+        let o = pair(host, .code(freshCode()))
+        check(words(o)?.contains("expired") == true && words(o)?.contains("Stand-in Mac") == true,
+              "expired: says the code expired, naming the Host (\(words(o) ?? "nil"))")
+        host.stop()
+    }),
+    ("refusals", {
+        let door = Door(code: freshCode())
+        let host = StandIn(door: door)
+        door.answer = .refuse(PairResult(ok: false, reason: PairResult.closed))
+        check(words(pair(host, .code(freshCode())))?.contains("Pair iPhone or iPad") == true, "refusals: closed: open a pairing window on the Host")
+        door.answer = .refuse(PairResult(ok: false, reason: PairResult.stopped))
+        check(words(pair(host, .code(freshCode())))?.contains("too many wrong codes") == true, "refusals: stopped: too many wrong codes")
+        door.answer = .refuse(PairResult(ok: false, reason: "later", message: "Ask the cat."))
+        check(words(pair(host, .code(freshCode()))) == "Ask the cat.", "refusals: a reason this build does not know: the Host's own words")
+        host.stop()
+    }),
+    ("typo", {
+        let door = Door(code: freshCode())
+        let host = StandIn(door: door)
+        var code = Array(freshCode())
+        code[11] = code[11] == "0" ? "1" : "0"
+        let o = pair(host, .code(String(code)))
+        check(words(o)?.contains("typo") == true, "typo: a bad check digit is caught here (\(words(o) ?? "nil"))")
+        check(words(pair(host, .code("1234")))?.contains("12 digits") == true, "typo: too short")
+        Thread.sleep(forTimeInterval: 0.2)
+        check(door.requests.isEmpty && door.versions.isEmpty, "typo: the Host never hears of it")
+        host.stop()
+    }),
+    ("proofs", {
+        let code = freshCode()
+        let door = Door(code: code)
+        let host = StandIn(door: door)
+        door.answer = .badProof
+        check(paired(pair(host, .code(code))) == nil, "proofs: a Host that can't prove the code is not saved")
+        door.answer = .wrongMacID
+        check(paired(pair(host, .code(code))) == nil, "proofs: a Host naming another key's Mac ID is not saved")
+        host.stop()
+    }),
+    ("pins", {
+        let code = freshCode()
+        let door = Door(code: code)
+        let host = StandIn(door: door)
+        let stranger = RemoteIdentity(privateKey: RemoteKey.generate()!)!
+        // A link pinned to another key: never sends its proof.
+        let link = PairLink(fingerprint: stranger.fingerprint, secret: Data(repeating: 3, count: 16), name: "Stand-in Mac", port: 7455, addresses: [])
+        check(paired(pair(host, .link(link), pin: link.fingerprint)) == nil, "pins: a link for another key does not pair")
+        check(door.requests.isEmpty, "pins: and sends no kind 19")
+        // This Mac not paired: the Host refuses it in the handshake.
+        withSession(to: host, parameters: ClientSession.pinnedParameters(identity: device, pin: door.identity.fingerprint), expectReach: false) { host, _, owner in
+            check(wait(4) { !owner.ends.isEmpty }, "pins: an unpaired key's session ends")
+            check(host.received.isEmpty, "pins: the Host read nothing from an unpaired key")
+        }
+        host.stop()
+        // Paired, but pinned to another key: the handshake ends on this side, nothing is said. A
+        // fresh stand-in (one that refused a handshake may serve no more), which would take this Mac.
+        let door2 = Door(code: code)
+        door2.addPaired(device.fingerprint)
+        let host2 = StandIn(door: door2)
+        withSession(to: host2, parameters: ClientSession.pinnedParameters(identity: device, pin: stranger.fingerprint), expectReach: false) { host, _, owner in
+            check(wait(4) { !owner.ends.isEmpty }, "pins: a session pinned to another key ends")
+            check(host.received.isEmpty, "pins: and the Host hears nothing from it")
+        }
+        host2.stop()
+    }),
+    ("link", {
+        let secret = Data((0..<16).map { UInt8($0) })
+        let door = Door(secret: secret)
+        let host = StandIn(door: door)
+        let link = PairLink(fingerprint: door.identity.fingerprint, secret: secret, name: "Stand-in Mac", port: 7455, addresses: [])
+        let h = paired(pair(host, .link(link), pin: link.fingerprint))
+        check(h?.macID == door.macID, "link: a sill://pair link pairs with its Host")
+        check(door.requests.first?.0.method == PairRequest.qr, "link: method qr, the link's secret as the key")
+        check(h.map { $0.savedMac(method: PairRequest.qr).method } == "qr", "link: saved as paired by link")
+        host.stop()
+    }),
+    ("targets", {
+        // The first target answers nothing (a closed port); the next one pairs.
+        let code = freshCode()
+        let door = Door(code: code)
+        let host = StandIn(door: door)
+        let dead = try! NWListener(using: .tcp, on: .any)
+        let q = DispatchQueue(label: "dead")
+        let ready = DispatchSemaphore(value: 0)
+        dead.stateUpdateHandler = { if case .ready = $0 { ready.signal() } }
+        dead.newConnectionHandler = { $0.cancel() }
+        dead.start(queue: q); ready.wait()
+        let deadPort = dead.port!
+        dead.cancel()
+        Thread.sleep(forTimeInterval: 0.1)
+        let o = pair(host, .code(code), targets: [.hostPort(host: "127.0.0.1", port: deadPort), .hostPort(host: "127.0.0.1", port: host.port)])
+        check(paired(o)?.endpoint == .hostPort(host: "127.0.0.1", port: host.port), "targets: the one that answered pairs, and is the endpoint kept")
+        host.stop()
+    }),
+    ("ask", {
+        let door = Door(code: freshCode())
+        door.answer = .shown
+        let host = StandIn(door: door)
+        let o = pair(host, .ask)
+        if case .asked(let reason, let fp, _)? = o {
+            check(reason == PairResult.shown && fp == door.identity.fingerprint, "ask: the Host's answer and its key, to pin the code to")
+        } else { check(false, "ask: answered (\(String(describing: o)))") }
+        check(door.requests.first?.0.method == PairRequest.ask && door.requests.first?.0.proof == "", "ask: method ask, no proof")
+        host.stop()
+    }),
+
     ("first", {
         withSession(pick: .firstWindow) { host, _, owner in
             check(wait(2) { !host.received.isEmpty }, "first: the stand-in hears from the session")
             check(host.received.first?.0 == .hello, "first: the hello is the first message")
             check(Wire.decode(Hello.self, from: host.received.first?.1 ?? Data()) == hello, "first: the hello carries the version, build, protocol and device")
             host.send(.windowList, Wire.encode(twoWindows))
-            check(wait(2) { kinds(host).count >= 3 }, "first: two more messages after the list")
-            check(kinds(host) == [.hello, .selectSource, .viewport], "first: hello, then the pick, then the Viewport")
+            check(wait(2) { kinds(host).count >= 4 }, "first: three more messages after the list")
+            check(kinds(host) == [.hello, .selectSource, .viewport, .fetchMenu], "first: hello, then the pick, the Viewport, the menus subscription")
             let picked = host.received.first { $0.0 == .selectSource }.flatMap { Wire.decode(StreamSource.self, from: $0.1) }
             check(picked == .window(41), "first: the first Window is picked")
             let sent = host.received.first { $0.0 == .viewport }.flatMap { Wire.decode(Viewport.self, from: $0.1) }
@@ -159,8 +477,8 @@ let cases: [(String, () -> Void)] = [
     ("eager", {
         let list = StreamMessage(kind: .windowList, timestamp: 1, isKeyframe: false, payload: Wire.encode(twoWindows)).serialized()
         withSession(pick: .firstWindow, eager: list) { host, _, _ in
-            check(wait(2) { kinds(host).count >= 3 }, "eager: the session answers a list sent on connect")
-            check(kinds(host) == [.hello, .selectSource, .viewport], "eager: still the hello first, then the pick and the Viewport")
+            check(wait(2) { kinds(host).count >= 4 }, "eager: the session answers a list sent on connect")
+            check(kinds(host) == [.hello, .selectSource, .viewport, .fetchMenu], "eager: still the hello first, then the pick, the Viewport and the menus subscription")
         }
     }),
     ("desktop", {
@@ -251,7 +569,267 @@ let cases: [(String, () -> Void)] = [
     }),
 ]
 
+// MARK: Reconnect (DCritelli/sill#9)
+
+/// A ClientConnection's owner: the states it reported and how often it was asked where the Host is.
+final class ConnOwner {
+    private let lock = NSLock()
+    private var _states: [ClientConnection.State] = [], _dials = 0, _goodbyes: [Goodbye] = []
+    var states: [ClientConnection.State] { lock.lock(); defer { lock.unlock() }; return _states }
+    var dials: Int { lock.lock(); defer { lock.unlock() }; return _dials }
+    var goodbyes: [Goodbye] { lock.lock(); defer { lock.unlock() }; return _goodbyes }
+    var stopped: (reason: String, storeLink: Bool)? {
+        for case .stopped(let r, let l) in states { return (r, l) }
+        return nil
+    }
+    var reconnecting: Bool { states.contains { if case .reconnecting = $0 { return true }; return false } }
+    func dialed() { lock.lock(); _dials += 1; lock.unlock() }
+    func note(_ s: ClientConnection.State) { lock.lock(); _states.append(s); lock.unlock() }
+    func note(_ g: Goodbye) { lock.lock(); _goodbyes.append(g); lock.unlock() }
+}
+
+/// A connection to whichever stand-in `where` names now (nil: nowhere), redialing after 0.05 s.
+func makeConnection(_ owner: ConnOwner, pick: ClientSession.Pick = .firstWindow, maxAttempts: Int = 12, wait: Double = 0.05,
+                    where host: @escaping () -> StandIn?) -> ClientConnection {
+    let c = ClientConnection(name: "Stand-in", saved: true, hello: hello, pick: pick, viewport: { viewport },
+                             dial: {
+                                 owner.dialed()
+                                 return host().map { ClientConnection.Dial(endpoint: .hostPort(host: "127.0.0.1", port: $0.port),
+                                                                           parameters: ClientSession.plainParameters()) }
+                             }, schedule: [wait], maxAttempts: maxAttempts)
+    c.onState = { owner.note($0) }
+    c.onGoodbye = { owner.note($0) }
+    return c
+}
+
+func sources(_ host: StandIn) -> [StreamSource] {
+    host.received.filter { $0.0 == .selectSource }.compactMap { Wire.decode(StreamSource.self, from: $0.1) }
+}
+
+/// Connects to `a`, lets `a` list `list` and `a` be reached by the pick; then `drop` and the owner
+/// is handed the connection, with `current` naming the Host to dial next.
+func reconnectCase(_ name: String, pick: ClientSession.Pick = .firstWindow, first: WindowList = twoWindows,
+                   _ body: (ConnOwner, ClientConnection, StandIn, (StandIn?) -> Void) -> Void) {
+    let a = StandIn()
+    let lock = NSLock()
+    var current: StandIn? = a
+    let owner = ConnOwner()
+    let c = makeConnection(owner, pick: pick) { lock.lock(); defer { lock.unlock() }; return current }
+    c.start()
+    if !wait(2, { !a.received.isEmpty }) { check(false, "\(name): the connection reaches the stand-in") }
+    a.send(.windowList, Wire.encode(first))
+    if !wait(2, { owner.states.contains(.connected) }) { check(false, "\(name): connected") }
+    body(owner, c, a) { lock.lock(); current = $0; lock.unlock() }
+    c.stop()
+    a.stop()
+}
+
+func goodbye(_ g: Goodbye) -> Data { Wire.encode(g) }
+
+let reconnectCases: [(String, () -> Void)] = [
+    ("schedule", {
+        let waits = (0..<9).map { RedialPolicy.delay(attempt: $0) }
+        check(waits.first == 0.5, "schedule: the first redial comes soon")
+        check(zip(waits, waits.dropFirst()).allSatisfy { $0 <= $1 } && waits[1] > waits[0], "schedule: the waits grow")
+        check(waits.last == 30 && RedialPolicy.delay(attempt: 100) == 30, "schedule: and stop growing at 30 s")
+    }),
+    ("redial", {
+        reconnectCase("redial") { owner, _, a, redirect in
+            let b = StandIn()
+            redirect(b)
+            a.close()   // the link dropped: no goodbye
+            check(wait(2) { owner.reconnecting }, "redial: Reconnecting is reported")
+            check(wait(3) { !b.received.isEmpty }, "redial: the Host is dialed again where it is now")
+            check(b.received.first?.0 == .hello, "redial: the hello first on the new connection")
+            check(owner.stopped == nil, "redial: not stopped")
+            b.send(.windowList, Wire.encode(twoWindows))
+            check(wait(2) { owner.states.last == .connected }, "redial: connected again")
+            b.stop()
+        }
+    }),
+    ("resume", {
+        var later = twoWindows
+        later.active = .window(42)
+        reconnectCase("resume") { owner, _, a, redirect in
+            a.send(.windowList, Wire.encode(later))   // the user clicked the second thumbnail
+            Thread.sleep(forTimeInterval: 0.15)
+            let b = StandIn()
+            redirect(b)
+            a.close()
+            check(wait(3) { !b.received.isEmpty }, "resume: redialed")
+            b.send(.windowList, Wire.encode(twoWindows))   // the new Host session lists no active Source
+            check(wait(2) { !sources(b).isEmpty }, "resume: a pick is sent")
+            check(sources(b) == [.window(42)], "resume: the same Window, not the first")
+            check(kinds(b).firstIndex(of: .selectSource)! < kinds(b).firstIndex(of: .viewport)!, "resume: the Viewport after the pick")
+            b.stop()
+        }
+    }),
+    ("resumedesktop", {
+        var desk = twoWindows
+        desk.active = .desktop
+        reconnectCase("resumedesktop") { owner, _, a, redirect in
+            a.send(.windowList, Wire.encode(desk))
+            Thread.sleep(forTimeInterval: 0.15)
+            let b = StandIn()
+            redirect(b)
+            a.close()
+            wait(3) { !b.received.isEmpty }
+            b.send(.windowList, Wire.encode(twoWindows))
+            check(wait(2) { !sources(b).isEmpty }, "resumedesktop: a pick is sent")
+            check(sources(b) == [.desktop], "resumedesktop: the Desktop again")
+            b.stop()
+        }
+    }),
+    ("resumegone", {
+        var later = twoWindows
+        later.active = .window(42)
+        reconnectCase("resumegone") { owner, _, a, redirect in
+            a.send(.windowList, Wire.encode(later))
+            Thread.sleep(forTimeInterval: 0.15)
+            let b = StandIn()
+            redirect(b)
+            a.close()
+            wait(3) { !b.received.isEmpty }
+            var gone = twoWindows
+            gone.windows.removeAll { $0.id == 42 }
+            b.send(.windowList, Wire.encode(gone))
+            check(wait(2) { !sources(b).isEmpty }, "resumegone: a pick is sent")
+            check(sources(b) == [.desktop], "resumegone: the Window is gone, so the Desktop")
+            b.stop()
+        }
+    }),
+    ("quitgoodbye", {
+        reconnectCase("quitgoodbye") { owner, _, a, redirect in
+            let b = StandIn()
+            redirect(b)
+            a.send(.goodbye, goodbye(Goodbye(reason: Goodbye.quit)))
+            Thread.sleep(forTimeInterval: 0.15)   // the goodbye is written before the Host closes
+            a.close()
+            check(wait(3) { !b.received.isEmpty }, "quitgoodbye: a goodbye that allows it is followed by a redial")
+            check(owner.stopped == nil, "quitgoodbye: not stopped")
+            b.stop()
+        }
+    }),
+    ("noticeredial", {
+        reconnectCase("noticeredial") { owner, _, a, redirect in
+            let b = StandIn()
+            redirect(b)
+            a.send(.goodbye, goodbye(Goodbye(reason: "later", message: "Back soon.", reconnect: true)))
+            Thread.sleep(forTimeInterval: 0.15)   // the goodbye is written before the Host closes
+            a.close()
+            check(wait(3) { !b.received.isEmpty }, "noticeredial: a notice with reconnect true redials")
+            b.stop()
+        }
+    }),
+    ("removed", {
+        reconnectCase("removed") { owner, _, a, redirect in
+            let b = StandIn()
+            redirect(b)
+            a.send(.goodbye, goodbye(Goodbye(reason: Goodbye.removed)))
+            Thread.sleep(forTimeInterval: 0.15)   // the goodbye is written before the Host closes
+            a.close()
+            check(wait(2) { owner.stopped != nil }, "removed: stopped")
+            check(owner.stopped?.reason.contains("removed this Mac") == true, "removed: the reason is surfaced (\(owner.stopped?.reason ?? "-"))")
+            check(owner.stopped?.storeLink == false, "removed: no App Store offer")
+            let dials = owner.dials
+            Thread.sleep(forTimeInterval: 0.4)
+            check(owner.dials == dials && b.received.isEmpty, "removed: no redial")
+            check(!owner.reconnecting, "removed: Reconnecting never shown")
+            b.stop()
+        }
+    }),
+    ("update", {
+        reconnectCase("update") { owner, _, a, redirect in
+            let b = StandIn()
+            redirect(b)
+            a.send(.goodbye, goodbye(Goodbye(reason: Goodbye.update, message: "Update Sill on your Mac to keep using Stand-in.",
+                                             minimumVersion: "1.2", reconnect: false)))
+            Thread.sleep(forTimeInterval: 0.15)   // the goodbye is written before the Host closes
+            a.close()
+            check(wait(2) { owner.stopped != nil }, "update: stopped")
+            check(owner.stopped?.reason == "Update Sill on your Mac to keep using Stand-in.", "update: the Host's own words")
+            check(owner.stopped?.storeLink == true, "update: the App Store is offered")
+            Thread.sleep(forTimeInterval: 0.4)
+            check(b.received.isEmpty, "update: no redial")
+            b.stop()
+        }
+    }),
+    ("notice", {
+        reconnectCase("notice") { owner, _, a, redirect in
+            let b = StandIn()
+            redirect(b)
+            a.send(.goodbye, goodbye(Goodbye(reason: "unpaired", message: "This Mac was unpaired.", reconnect: false)))
+            Thread.sleep(forTimeInterval: 0.15)   // the goodbye is written before the Host closes
+            a.close()
+            check(wait(2) { owner.stopped != nil }, "notice: stopped")
+            check(owner.stopped?.reason == "This Mac was unpaired.", "notice: the Host's words")
+            Thread.sleep(forTimeInterval: 0.4)
+            check(b.received.isEmpty, "notice: no redial")
+            b.stop()
+        }
+    }),
+    ("neverup", {
+        let dead = StandIn()
+        dead.stop()   // nothing listens at its port any more
+        let owner = ConnOwner()
+        let c = makeConnection(owner) { dead }
+        c.start()
+        check(wait(3) { owner.stopped != nil }, "neverup: a Host that never answered stops")
+        Thread.sleep(forTimeInterval: 0.4)
+        check(owner.dials == 1 && !owner.reconnecting, "neverup: dialed once, no retry loop")
+        c.stop()
+    }),
+    ("giveup", {
+        let a = StandIn()
+        let lock = NSLock()
+        var current: StandIn? = a
+        let owner = ConnOwner()
+        let c = makeConnection(owner, maxAttempts: 2) { lock.lock(); defer { lock.unlock() }; return current }
+        c.start()
+        wait(2) { !a.received.isEmpty }
+        a.send(.windowList, Wire.encode(twoWindows))
+        wait(2) { owner.states.contains(.connected) }
+        lock.lock(); current = nil; lock.unlock()   // the Host is nowhere
+        a.close()
+        check(wait(3) { owner.stopped != nil }, "giveup: stops after a bounded number of attempts")
+        check(owner.dials == 3, "giveup: the first dial and two redials (\(owner.dials))")
+        c.stop()
+        a.stop()
+    }),
+    ("stopwaiting", {
+        // stop() while the next dial is still waiting out its delay: it never comes.
+        let a = StandIn(), b = StandIn()
+        let lock = NSLock()
+        var current: StandIn? = a
+        let owner = ConnOwner()
+        let c = makeConnection(owner, wait: 0.4) { lock.lock(); defer { lock.unlock() }; return current }
+        c.start()
+        wait(2) { !a.received.isEmpty }
+        a.send(.windowList, Wire.encode(twoWindows))
+        wait(2) { owner.states.contains(.connected) }
+        lock.lock(); current = b; lock.unlock()
+        a.close()
+        check(wait(2) { owner.reconnecting }, "stopwaiting: Reconnecting is reported")
+        c.stop()
+        Thread.sleep(forTimeInterval: 0.8)
+        check(b.received.isEmpty, "stopwaiting: stop() during the wait cancels the redial")
+        a.stop(); b.stop()
+    }),
+    ("stopquiet", {
+        reconnectCase("stopquiet") { owner, c, a, redirect in
+            let b = StandIn()
+            redirect(b)
+            c.stop()
+            a.close()
+            Thread.sleep(forTimeInterval: 0.4)
+            check(b.received.isEmpty, "stopquiet: no redial after stop()")
+            check(owner.stopped == nil && !owner.reconnecting, "stopquiet: no state after stop()")
+            b.stop()
+        }
+    }),
+]
+
 let wanted = Set(CommandLine.arguments.dropFirst())
-for (name, run) in cases where wanted.isEmpty || wanted.contains(name) { run() }
+for (name, run) in cases + reconnectCases where wanted.isEmpty || wanted.contains(name) { run() }
 print(failures == 0 ? "client-session: all ok" : "client-session: \(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

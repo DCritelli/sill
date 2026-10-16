@@ -8,13 +8,20 @@ import StreamProtocol
 /// the parameter sets, one sample buffer per access unit, shown at once), without its pointer
 /// sprite: the Mac Client sets the local cursor instead (DCritelli/sill#3).
 ///
-/// The mouse goes through the input translator (InputTranslator.swift), which also says where the
+/// The mouse and scrolling go through the input translator (InputTranslator.swift), which also says where the
 /// picture is drawn, fitted with bars; the view only feeds it AppKit's events and hands on what it
 /// returns (`onInput`). Over the picture the cursor is the Host's shape, through a cursor rect, so
 /// AppKit swaps it as the pointer crosses the edge with nothing drawn by hand; elsewhere it is the
 /// arrow. Flipped, so its points run from the top left as the translator's do.
+///
+/// Keys (DCritelli/sill#4): while this view is the key window's first responder, every key down, up
+/// and modifier change goes to the translator through a local event monitor, which runs before
+/// AppKit looks for a key equivalent, so ⌘-shortcuts (⌘C, ⌘W, ⌘Q, ⌘H…) go to the Host and not to Sill
+/// Client's menus (they stay reachable with the mouse). macOS never hands an app the shortcuts it
+/// keeps (⌘Tab, ⌘Space, Mission Control), so those stay local. When the window stops being key,
+/// the translator lets go of everything held; the click that brings it forward reaches nothing.
 final class VideoView: NSView {
-    /// What the translator made of a mouse event, in order. On main.
+    /// What the translator made of a mouse, scroll, key or focus event, in order. On main.
     var onInput: (([InputEvent]) -> Void)?
 
     private let displayLayer = AVSampleBufferDisplayLayer()
@@ -22,6 +29,14 @@ final class VideoView: NSView {
     private var translator = InputTranslator()
     private var remoteCursor: NSCursor?
     private var trackingArea: NSTrackingArea?
+    /// The local monitor that takes the keys while this view has them, and the key-window observer.
+    private var keyMonitor: Any?
+    private var resignObserver: NSObjectProtocol?
+    /// The key code of a shortcut kept local, whose up is kept local too.
+    private var localKeyCode: UInt16?
+    /// The event number of the click AppKit asked about in `acceptsFirstMouse`: the one that brings
+    /// the window forward.
+    private var firstMouseNumber: Int?
     /// Touched only on the session's queue (`apply`, `enqueue`), as the layer allows.
     private var formatDescription: CMVideoFormatDescription?
     private var lastParameterSets: Data?
@@ -40,10 +55,72 @@ final class VideoView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     override var isFlipped: Bool { true }
+    override var acceptsFirstResponder: Bool { true }
+
+    // MARK: Keys and focus
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+        if let resignObserver { NotificationCenter.default.removeObserver(resignObserver) }
+        keyMonitor = nil
+        resignObserver = nil
+        guard let window else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
+            guard let self, let window = self.window, event.window === window, window.isKeyWindow,
+                  window.firstResponder === self else { return event }
+            // Sill Client's own View › Hide Bar (⌃⌘B) is the one shortcut that stays local (#7).
+            if event.type == .keyDown, event.modifierFlags.intersection([.control, .command, .option, .shift]) == [.control, .command],
+               event.charactersIgnoringModifiers?.lowercased() == "b" {
+                self.localKeyCode = event.keyCode
+                NSApp.mainMenu?.performKeyEquivalent(with: event)
+                return nil
+            }
+            if event.type == .keyUp, self.localKeyCode == event.keyCode {
+                self.localKeyCode = nil
+                return nil
+            }
+            self.key(event)
+            return nil
+        }
+        resignObserver = NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: window,
+                                                                queue: .main) { [weak self] _ in
+            guard let self else { return }
+            self.hand(self.translator.windowResignedKey())
+        }
+    }
+
+    private func key(_ event: NSEvent) {
+        let flags = UInt64(event.modifierFlags.rawValue)
+        switch event.type {
+        case .keyDown: hand(translator.keyDown(event.keyCode, flags: flags, isRepeat: event.isARepeat))
+        case .keyUp: hand(translator.keyUp(event.keyCode))
+        case .flagsChanged: hand(translator.flagsChanged(event.keyCode, flags: flags))
+        default: break
+        }
+    }
+
+    /// A click into an inactive window: taken (so the view, not AppKit, decides), and remembered as
+    /// the click that only brings the window forward.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        firstMouseNumber = event?.eventNumber
+        return true
+    }
+
+    /// Whether this down only brings the window forward: the click `acceptsFirstMouse` was asked
+    /// about, or any click while the window is not key (a right click does not activate it).
+    private func bringsForward(_ event: NSEvent) -> Bool {
+        defer { firstMouseNumber = nil }
+        return event.eventNumber == firstMouseNumber || !(window?.isKeyWindow ?? false)
+    }
+
+    /// The content size changed (every layout pass of a resize; DCritelli/sill#6). On main.
+    var onContentSize: ((CGSize) -> Void)?
 
     override func layout() {
         super.layout()
         translator.contentSize = bounds.size
+        onContentSize?(bounds.size)
         placePicture()
     }
 
@@ -102,10 +179,45 @@ final class VideoView: NSView {
     override func mouseMoved(with event: NSEvent) { hand(translator.mouseMoved(to: point(event))) }
     override func mouseDragged(with event: NSEvent) { hand(translator.mouseMoved(to: point(event))) }
     override func rightMouseDragged(with event: NSEvent) { hand(translator.mouseMoved(to: point(event))) }
-    override func mouseDown(with event: NSEvent) { hand(translator.mouseDown(.left, at: point(event))) }
+    override func mouseDown(with event: NSEvent) {
+        hand(translator.mouseDown(.left, at: point(event), bringsWindowForward: bringsForward(event)))
+    }
     override func mouseUp(with event: NSEvent) { hand(translator.mouseUp(.left, at: point(event))) }
-    override func rightMouseDown(with event: NSEvent) { hand(translator.mouseDown(.right, at: point(event))) }
+    override func rightMouseDown(with event: NSEvent) {
+        hand(translator.mouseDown(.right, at: point(event), bringsWindowForward: bringsForward(event)))
+    }
     override func rightMouseUp(with event: NSEvent) { hand(translator.mouseUp(.right, at: point(event))) }
+
+    /// Scrolling (DCritelli/sill#5): a trackpad's precise deltas are points; a wheel's are lines, so
+    /// its point deltas come from the CGEvent (the pixels macOS would scroll a local view by).
+    /// AppKit's deltas already follow the natural-scrolling setting, so they go to the translator
+    /// as they are, with the phases it maps to the Host's gesture and momentum.
+    override func scrollWheel(with event: NSEvent) {
+        var dx = event.scrollingDeltaX, dy = event.scrollingDeltaY
+        if !event.hasPreciseScrollingDeltas, let cg = event.cgEvent {
+            dx = cg.getDoubleValueField(.scrollWheelEventPointDeltaAxis2)
+            dy = cg.getDoubleValueField(.scrollWheelEventPointDeltaAxis1)
+        }
+        hand(translator.scrolled(at: point(event), dx: dx, dy: dy,
+                                 phase: Self.gesturePhase(event.phase), momentum: Self.momentumPhase(event.momentumPhase)))
+    }
+
+    private static func gesturePhase(_ phase: NSEvent.Phase) -> InputTranslator.GesturePhase {
+        if phase.contains(.began) { return .began }
+        if phase.contains(.changed) { return .changed }
+        if phase.contains(.ended) { return .ended }
+        if phase.contains(.cancelled) { return .cancelled }
+        if phase.contains(.mayBegin) { return .mayBegin }
+        if phase.contains(.stationary) { return .stationary }
+        return .none
+    }
+
+    private static func momentumPhase(_ phase: NSEvent.Phase) -> InputTranslator.MomentumPhase {
+        if phase.contains(.began) { return .began }
+        if phase.contains(.changed) || phase.contains(.stationary) { return .changed }
+        if phase.contains(.ended) || phase.contains(.cancelled) { return .ended }
+        return .none
+    }
 
     /// A new format: the Host repeats its parameter sets with every keyframe, and only a real
     /// change (a new Source, a resize) needs a new description and a blank layer.
