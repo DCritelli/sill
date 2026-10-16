@@ -12,7 +12,7 @@ import StreamProtocol
 /// the Host lists no Window) and sends it with the Viewport; it pings once a second; it hands the
 /// video and the Host's cursor shape to its owner. Input goes out as the owner's input translator makes it
 /// (`sendInput`, DCritelli/sill#3). A plain door (`plainParameters`) or a TLS one pinned to the
-/// Host's key (`pinnedParameters`, after ClientPairing, DCritelli/sill#2). No reconnect yet (#9).
+/// Host's key (`pinnedParameters`, after ClientPairing, DCritelli/sill#2). The redial is ClientConnection's (#9).
 ///
 /// Every callback runs on `queue`, one at a time; `start()` and `stop()` may be called from any
 /// thread. Foundation, Network and StreamProtocol only: checked with swiftc against a stand-in Host
@@ -22,6 +22,9 @@ final class ClientSession {
     enum Pick: Equatable {
         case firstWindow
         case desktop
+        /// A redial (#9): the Source the dropped session had, when this Host still lists it (a
+        /// Window that is gone, or no Source at all, is the Desktop).
+        case resume(StreamSource)
     }
 
     var onWindowList: ((WindowList) -> Void)?
@@ -38,6 +41,8 @@ final class ClientSession {
     var onIcon: ((Data) -> Void)?
     /// The Host's menus (kind 24): the app's top level, and the answers to fetches and presses (#8).
     var onMacMenu: ((MacMenu) -> Void)?
+    /// The Host's goodbye (kind 22), before it closes the connection (#9).
+    var onGoodbye: ((Goodbye) -> Void)?
     /// Once, when the session ends by itself (never after `stop()`), with a line for the log.
     var onEnd: ((String) -> Void)?
 
@@ -217,6 +222,8 @@ final class ClientSession {
             onIcon?(payload)
         case .macMenu:
             if let menu = Wire.decode(MacMenu.self, from: payload) { onMacMenu?(menu) }
+        case .goodbye:
+            if let goodbye = Wire.decode(Goodbye.self, from: payload) { onGoodbye?(goodbye) }
         case .hostSettings:
             if let state = Wire.decode(HostSettingsState.self, from: payload) { onHostMaxFPS?(state.settings.maxFPS) }
         default:
@@ -229,6 +236,8 @@ final class ClientSession {
         switch pick {
         case .desktop: source = .desktop
         case .firstWindow: source = list.windows.first.map { .window($0.id) } ?? .desktop
+        case .resume(.window(let id)) where list.windows.contains { $0.id == id }: source = .window(id)
+        case .resume: source = .desktop
         }
         picked = source
         send(.selectSource, Wire.encode(source))

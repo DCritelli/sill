@@ -141,8 +141,63 @@ private final class TileView: NSView {
 /// The stream window's content: the picture, with the Bar above it. Outside full screen the Bar takes
 /// its height from the picture; in full screen the picture keeps the whole screen and the Bar, when
 /// the pointer reaches the top edge, is drawn over it. The visibility rules are BarVisibility's.
+/// A message over the last picture (DCritelli/sill#9): "Reconnecting\u{2026}" while the Host is
+/// dialed again, or a Host's final reason with the way back to Connect to a Mac. It takes the
+/// mouse, so nothing reaches the Host through it.
+final class StatusOverlayView: NSView {
+    private let label = NSTextField(wrappingLabelWithString: "")
+    private let button = NSButton(title: "", target: nil, action: nil)
+    private var action: (() -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.withAlphaComponent(0.55).cgColor
+        label.font = .systemFont(ofSize: 18, weight: .medium)
+        label.textColor = .white
+        label.alignment = .center
+        label.maximumNumberOfLines = 0
+        button.bezelStyle = .rounded
+        button.target = self
+        button.action = #selector(pressed)
+        addSubview(label)
+        addSubview(button)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { self.frame.contains(point) ? (super.hitTest(point) ?? self) : nil }
+    override func mouseDown(with event: NSEvent) {}
+
+    func show(_ text: String, actionTitle: String?, action: (() -> Void)?) {
+        label.stringValue = text
+        button.title = actionTitle ?? ""
+        button.isHidden = actionTitle == nil
+        self.action = action
+        isHidden = false
+        needsLayout = true
+    }
+
+    @objc private func pressed() { action?() }
+
+    override func layout() {
+        super.layout()
+        let width = min(max(bounds.width - 48, 80), 460)
+        let text = label.sizeThatFits(NSSize(width: width, height: .greatestFiniteMagnitude))
+        let buttonHeight: CGFloat = button.isHidden ? 0 : 32
+        let gap: CGFloat = button.isHidden ? 0 : 14
+        let total = text.height + gap + buttonHeight
+        let top = (bounds.height - total) / 2
+        label.frame = NSRect(x: (bounds.width - width) / 2, y: top, width: width, height: text.height)
+        button.sizeToFit()
+        button.frame = NSRect(x: (bounds.width - button.frame.width) / 2, y: top + text.height + gap,
+                              width: button.frame.width, height: 32)
+    }
+}
+
 final class StreamContainerView: NSView {
     let bar = BarView(frame: .zero)
+    private let status = StatusOverlayView(frame: .zero)
     let video: NSView
     private(set) var visibility = BarVisibility()
     private var tracking: NSTrackingArea?
@@ -154,10 +209,19 @@ final class StreamContainerView: NSView {
         super.init(frame: video.frame)
         addSubview(video)
         addSubview(bar)
+        addSubview(status)
+        status.isHidden = true
     }
     required init?(coder: NSCoder) { fatalError() }
 
     var barVisible: Bool { visibility.visible }
+
+    /// A message over the picture, with a button when `actionTitle` is given.
+    func showStatus(_ text: String, actionTitle: String? = nil, action: (() -> Void)? = nil) {
+        status.show(text, actionTitle: actionTitle, action: action)
+        needsLayout = true
+    }
+    func hideStatus() { status.isHidden = true }
 
     func toggleBar() { visibility.toggle(); needsLayout = true }
     func setFullScreen(_ on: Bool) {
@@ -173,6 +237,7 @@ final class StreamContainerView: NSView {
         bar.frame = CGRect(x: 0, y: 0, width: bounds.width, height: h)
         let inset = (visibility.userHidden || visibility.fullScreen) ? 0 : h
         video.frame = CGRect(x: 0, y: inset, width: bounds.width, height: max(bounds.height - inset, 0))
+        status.frame = video.frame
     }
 
     override func updateTrackingAreas() {

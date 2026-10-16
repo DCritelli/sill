@@ -24,7 +24,15 @@
 // list picks nothing more), video (parameter sets and frames reach the owner, keyframe flag and
 // bytes intact, in order), ping (a ping of 8 bytes within 1.5 s), hostclose (the Host closes:
 // onEnd once), input (sendInput(_:): each InputEvent one kind 8, in order), cursor (a cursor shape handed
-// on intact), stop (stop(): no onEnd, and the connection closes). Prints "ok" or "FAIL" per check;
+// on intact), stop (stop(): no onEnd, and the connection closes).
+//
+// Reconnect cases (DCritelli/sill#9, ClientConnection with GoodbyePolicy): redial (the Host drops with
+// no goodbye: reconnecting, then dialed again where it is now, hello first, and the Source the user
+// had resumed), resumedesktop, resumegone (the Window is gone: the Desktop), quitgoodbye (a goodbye
+// that allows it redials), noticeredial (a notice with reconnect true redials), removed / update /
+// notice (a goodbye without reconnect: stopped with the Host's reason, the App Store offered for
+// update, never dialed again), neverup (a Host that never answered is not dialed again), giveup (a
+// bounded number of attempts), stopquiet (stop(): no state, no redial). Prints "ok" or "FAIL" per check;
 // exits 1 on any failure.
 import Foundation
 import Network
@@ -561,7 +569,267 @@ let cases: [(String, () -> Void)] = [
     }),
 ]
 
+// MARK: Reconnect (DCritelli/sill#9)
+
+/// A ClientConnection's owner: the states it reported and how often it was asked where the Host is.
+final class ConnOwner {
+    private let lock = NSLock()
+    private var _states: [ClientConnection.State] = [], _dials = 0, _goodbyes: [Goodbye] = []
+    var states: [ClientConnection.State] { lock.lock(); defer { lock.unlock() }; return _states }
+    var dials: Int { lock.lock(); defer { lock.unlock() }; return _dials }
+    var goodbyes: [Goodbye] { lock.lock(); defer { lock.unlock() }; return _goodbyes }
+    var stopped: (reason: String, storeLink: Bool)? {
+        for case .stopped(let r, let l) in states { return (r, l) }
+        return nil
+    }
+    var reconnecting: Bool { states.contains { if case .reconnecting = $0 { return true }; return false } }
+    func dialed() { lock.lock(); _dials += 1; lock.unlock() }
+    func note(_ s: ClientConnection.State) { lock.lock(); _states.append(s); lock.unlock() }
+    func note(_ g: Goodbye) { lock.lock(); _goodbyes.append(g); lock.unlock() }
+}
+
+/// A connection to whichever stand-in `where` names now (nil: nowhere), redialing after 0.05 s.
+func makeConnection(_ owner: ConnOwner, pick: ClientSession.Pick = .firstWindow, maxAttempts: Int = 12, wait: Double = 0.05,
+                    where host: @escaping () -> StandIn?) -> ClientConnection {
+    let c = ClientConnection(name: "Stand-in", saved: true, hello: hello, pick: pick, viewport: { viewport },
+                             dial: {
+                                 owner.dialed()
+                                 return host().map { ClientConnection.Dial(endpoint: .hostPort(host: "127.0.0.1", port: $0.port),
+                                                                           parameters: ClientSession.plainParameters()) }
+                             }, schedule: [wait], maxAttempts: maxAttempts)
+    c.onState = { owner.note($0) }
+    c.onGoodbye = { owner.note($0) }
+    return c
+}
+
+func sources(_ host: StandIn) -> [StreamSource] {
+    host.received.filter { $0.0 == .selectSource }.compactMap { Wire.decode(StreamSource.self, from: $0.1) }
+}
+
+/// Connects to `a`, lets `a` list `list` and `a` be reached by the pick; then `drop` and the owner
+/// is handed the connection, with `current` naming the Host to dial next.
+func reconnectCase(_ name: String, pick: ClientSession.Pick = .firstWindow, first: WindowList = twoWindows,
+                   _ body: (ConnOwner, ClientConnection, StandIn, (StandIn?) -> Void) -> Void) {
+    let a = StandIn()
+    let lock = NSLock()
+    var current: StandIn? = a
+    let owner = ConnOwner()
+    let c = makeConnection(owner, pick: pick) { lock.lock(); defer { lock.unlock() }; return current }
+    c.start()
+    if !wait(2, { !a.received.isEmpty }) { check(false, "\(name): the connection reaches the stand-in") }
+    a.send(.windowList, Wire.encode(first))
+    if !wait(2, { owner.states.contains(.connected) }) { check(false, "\(name): connected") }
+    body(owner, c, a) { lock.lock(); current = $0; lock.unlock() }
+    c.stop()
+    a.stop()
+}
+
+func goodbye(_ g: Goodbye) -> Data { Wire.encode(g) }
+
+let reconnectCases: [(String, () -> Void)] = [
+    ("schedule", {
+        let waits = (0..<9).map { RedialPolicy.delay(attempt: $0) }
+        check(waits.first == 0.5, "schedule: the first redial comes soon")
+        check(zip(waits, waits.dropFirst()).allSatisfy { $0 <= $1 } && waits[1] > waits[0], "schedule: the waits grow")
+        check(waits.last == 30 && RedialPolicy.delay(attempt: 100) == 30, "schedule: and stop growing at 30 s")
+    }),
+    ("redial", {
+        reconnectCase("redial") { owner, _, a, redirect in
+            let b = StandIn()
+            redirect(b)
+            a.close()   // the link dropped: no goodbye
+            check(wait(2) { owner.reconnecting }, "redial: Reconnecting is reported")
+            check(wait(3) { !b.received.isEmpty }, "redial: the Host is dialed again where it is now")
+            check(b.received.first?.0 == .hello, "redial: the hello first on the new connection")
+            check(owner.stopped == nil, "redial: not stopped")
+            b.send(.windowList, Wire.encode(twoWindows))
+            check(wait(2) { owner.states.last == .connected }, "redial: connected again")
+            b.stop()
+        }
+    }),
+    ("resume", {
+        var later = twoWindows
+        later.active = .window(42)
+        reconnectCase("resume") { owner, _, a, redirect in
+            a.send(.windowList, Wire.encode(later))   // the user clicked the second thumbnail
+            Thread.sleep(forTimeInterval: 0.15)
+            let b = StandIn()
+            redirect(b)
+            a.close()
+            check(wait(3) { !b.received.isEmpty }, "resume: redialed")
+            b.send(.windowList, Wire.encode(twoWindows))   // the new Host session lists no active Source
+            check(wait(2) { !sources(b).isEmpty }, "resume: a pick is sent")
+            check(sources(b) == [.window(42)], "resume: the same Window, not the first")
+            check(kinds(b).firstIndex(of: .selectSource)! < kinds(b).firstIndex(of: .viewport)!, "resume: the Viewport after the pick")
+            b.stop()
+        }
+    }),
+    ("resumedesktop", {
+        var desk = twoWindows
+        desk.active = .desktop
+        reconnectCase("resumedesktop") { owner, _, a, redirect in
+            a.send(.windowList, Wire.encode(desk))
+            Thread.sleep(forTimeInterval: 0.15)
+            let b = StandIn()
+            redirect(b)
+            a.close()
+            wait(3) { !b.received.isEmpty }
+            b.send(.windowList, Wire.encode(twoWindows))
+            check(wait(2) { !sources(b).isEmpty }, "resumedesktop: a pick is sent")
+            check(sources(b) == [.desktop], "resumedesktop: the Desktop again")
+            b.stop()
+        }
+    }),
+    ("resumegone", {
+        var later = twoWindows
+        later.active = .window(42)
+        reconnectCase("resumegone") { owner, _, a, redirect in
+            a.send(.windowList, Wire.encode(later))
+            Thread.sleep(forTimeInterval: 0.15)
+            let b = StandIn()
+            redirect(b)
+            a.close()
+            wait(3) { !b.received.isEmpty }
+            var gone = twoWindows
+            gone.windows.removeAll { $0.id == 42 }
+            b.send(.windowList, Wire.encode(gone))
+            check(wait(2) { !sources(b).isEmpty }, "resumegone: a pick is sent")
+            check(sources(b) == [.desktop], "resumegone: the Window is gone, so the Desktop")
+            b.stop()
+        }
+    }),
+    ("quitgoodbye", {
+        reconnectCase("quitgoodbye") { owner, _, a, redirect in
+            let b = StandIn()
+            redirect(b)
+            a.send(.goodbye, goodbye(Goodbye(reason: Goodbye.quit)))
+            Thread.sleep(forTimeInterval: 0.15)   // the goodbye is written before the Host closes
+            a.close()
+            check(wait(3) { !b.received.isEmpty }, "quitgoodbye: a goodbye that allows it is followed by a redial")
+            check(owner.stopped == nil, "quitgoodbye: not stopped")
+            b.stop()
+        }
+    }),
+    ("noticeredial", {
+        reconnectCase("noticeredial") { owner, _, a, redirect in
+            let b = StandIn()
+            redirect(b)
+            a.send(.goodbye, goodbye(Goodbye(reason: "later", message: "Back soon.", reconnect: true)))
+            Thread.sleep(forTimeInterval: 0.15)   // the goodbye is written before the Host closes
+            a.close()
+            check(wait(3) { !b.received.isEmpty }, "noticeredial: a notice with reconnect true redials")
+            b.stop()
+        }
+    }),
+    ("removed", {
+        reconnectCase("removed") { owner, _, a, redirect in
+            let b = StandIn()
+            redirect(b)
+            a.send(.goodbye, goodbye(Goodbye(reason: Goodbye.removed)))
+            Thread.sleep(forTimeInterval: 0.15)   // the goodbye is written before the Host closes
+            a.close()
+            check(wait(2) { owner.stopped != nil }, "removed: stopped")
+            check(owner.stopped?.reason.contains("removed this Mac") == true, "removed: the reason is surfaced (\(owner.stopped?.reason ?? "-"))")
+            check(owner.stopped?.storeLink == false, "removed: no App Store offer")
+            let dials = owner.dials
+            Thread.sleep(forTimeInterval: 0.4)
+            check(owner.dials == dials && b.received.isEmpty, "removed: no redial")
+            check(!owner.reconnecting, "removed: Reconnecting never shown")
+            b.stop()
+        }
+    }),
+    ("update", {
+        reconnectCase("update") { owner, _, a, redirect in
+            let b = StandIn()
+            redirect(b)
+            a.send(.goodbye, goodbye(Goodbye(reason: Goodbye.update, message: "Update Sill on your Mac to keep using Stand-in.",
+                                             minimumVersion: "1.2", reconnect: false)))
+            Thread.sleep(forTimeInterval: 0.15)   // the goodbye is written before the Host closes
+            a.close()
+            check(wait(2) { owner.stopped != nil }, "update: stopped")
+            check(owner.stopped?.reason == "Update Sill on your Mac to keep using Stand-in.", "update: the Host's own words")
+            check(owner.stopped?.storeLink == true, "update: the App Store is offered")
+            Thread.sleep(forTimeInterval: 0.4)
+            check(b.received.isEmpty, "update: no redial")
+            b.stop()
+        }
+    }),
+    ("notice", {
+        reconnectCase("notice") { owner, _, a, redirect in
+            let b = StandIn()
+            redirect(b)
+            a.send(.goodbye, goodbye(Goodbye(reason: "unpaired", message: "This Mac was unpaired.", reconnect: false)))
+            Thread.sleep(forTimeInterval: 0.15)   // the goodbye is written before the Host closes
+            a.close()
+            check(wait(2) { owner.stopped != nil }, "notice: stopped")
+            check(owner.stopped?.reason == "This Mac was unpaired.", "notice: the Host's words")
+            Thread.sleep(forTimeInterval: 0.4)
+            check(b.received.isEmpty, "notice: no redial")
+            b.stop()
+        }
+    }),
+    ("neverup", {
+        let dead = StandIn()
+        dead.stop()   // nothing listens at its port any more
+        let owner = ConnOwner()
+        let c = makeConnection(owner) { dead }
+        c.start()
+        check(wait(3) { owner.stopped != nil }, "neverup: a Host that never answered stops")
+        Thread.sleep(forTimeInterval: 0.4)
+        check(owner.dials == 1 && !owner.reconnecting, "neverup: dialed once, no retry loop")
+        c.stop()
+    }),
+    ("giveup", {
+        let a = StandIn()
+        let lock = NSLock()
+        var current: StandIn? = a
+        let owner = ConnOwner()
+        let c = makeConnection(owner, maxAttempts: 2) { lock.lock(); defer { lock.unlock() }; return current }
+        c.start()
+        wait(2) { !a.received.isEmpty }
+        a.send(.windowList, Wire.encode(twoWindows))
+        wait(2) { owner.states.contains(.connected) }
+        lock.lock(); current = nil; lock.unlock()   // the Host is nowhere
+        a.close()
+        check(wait(3) { owner.stopped != nil }, "giveup: stops after a bounded number of attempts")
+        check(owner.dials == 3, "giveup: the first dial and two redials (\(owner.dials))")
+        c.stop()
+        a.stop()
+    }),
+    ("stopwaiting", {
+        // stop() while the next dial is still waiting out its delay: it never comes.
+        let a = StandIn(), b = StandIn()
+        let lock = NSLock()
+        var current: StandIn? = a
+        let owner = ConnOwner()
+        let c = makeConnection(owner, wait: 0.4) { lock.lock(); defer { lock.unlock() }; return current }
+        c.start()
+        wait(2) { !a.received.isEmpty }
+        a.send(.windowList, Wire.encode(twoWindows))
+        wait(2) { owner.states.contains(.connected) }
+        lock.lock(); current = b; lock.unlock()
+        a.close()
+        check(wait(2) { owner.reconnecting }, "stopwaiting: Reconnecting is reported")
+        c.stop()
+        Thread.sleep(forTimeInterval: 0.8)
+        check(b.received.isEmpty, "stopwaiting: stop() during the wait cancels the redial")
+        a.stop(); b.stop()
+    }),
+    ("stopquiet", {
+        reconnectCase("stopquiet") { owner, c, a, redirect in
+            let b = StandIn()
+            redirect(b)
+            c.stop()
+            a.close()
+            Thread.sleep(forTimeInterval: 0.4)
+            check(b.received.isEmpty, "stopquiet: no redial after stop()")
+            check(owner.stopped == nil && !owner.reconnecting, "stopquiet: no state after stop()")
+            b.stop()
+        }
+    }),
+]
+
 let wanted = Set(CommandLine.arguments.dropFirst())
-for (name, run) in cases where wanted.isEmpty || wanted.contains(name) { run() }
+for (name, run) in cases + reconnectCases where wanted.isEmpty || wanted.contains(name) { run() }
 print(failures == 0 ? "client-session: all ok" : "client-session: \(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

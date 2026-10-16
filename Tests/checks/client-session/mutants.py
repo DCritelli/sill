@@ -5,12 +5,16 @@ SP = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(SP, "..", "..", ".."))   # the repository
 OUT = os.path.join(ROOT, ".build", "checks", "client-session")   # the mutants' sources and binaries
 os.makedirs(OUT, exist_ok=True)
-FILES = ["Sources/SillClient/ClientSession.swift", "Sources/SillClient/ClientPairing.swift"]
+FILES = ["Sources/SillClient/ClientSession.swift", "Sources/SillClient/ClientPairing.swift", "Sources/SillClient/ClientConnection.swift"]
 ORIG = {f: open(os.path.join(ROOT, f)).read() for f in FILES}
 # SavedMacs.swift imports StreamProtocol, which is one module with this check (run.sh does the same).
 SAVED = os.path.join(OUT, "SavedMacs.swift")
+GOODBYE = os.path.join(OUT, "GoodbyePolicy.swift")
+open(GOODBYE, "w").write("".join(l for l in open(os.path.join(ROOT, "iOSClient/GoodbyePolicy.swift")) if l.strip() != "import StreamProtocol"))
 open(SAVED, "w").write("".join(l for l in open(os.path.join(ROOT, "iOSClient/SavedMacs.swift")) if l.strip() != "import StreamProtocol"))
 P = "Sources/SillClient/ClientPairing.swift"
+K = "Sources/SillClient/ClientConnection.swift"
+S = "Sources/SillClient/ClientSession.swift"
 MUTANTS = {
     "C1 no hello": [("            send(.hello, Wire.encode(hello))\n", "")],
     "C2 the hello after the start": [
@@ -20,7 +24,7 @@ MUTANTS = {
     "C4 no Desktop for an empty list": [("list.windows.first.map { .window($0.id) } ?? .desktop", "list.windows.first.map { .window($0.id) } ?? .none")],
     "C5 the Desktop pick ignored": [("        case .desktop: source = .desktop\n", "        case .desktop: source = list.windows.first.map { .window($0.id) } ?? .desktop\n")],
     "C6 every list picks": [("            if picked == nil { choose(from: list) }", "            choose(from: list)")],
-    "C7 no Viewport": [("        send(.viewport, Wire.encode(viewport))\n", "")],
+    "C7 no Viewport": [("        send(.selectSource, Wire.encode(source))\n        send(.viewport, Wire.encode(viewport))\n", "        send(.selectSource, Wire.encode(source))\n")],
     "C8 the Viewport before the pick": [
         ("        send(.selectSource, Wire.encode(source))\n        send(.viewport, Wire.encode(viewport))\n",
          "        send(.viewport, Wire.encode(viewport))\n        send(.selectSource, Wire.encode(source))\n")],
@@ -54,6 +58,23 @@ MUTANTS = {
     "P14 the ask's key not handed back": [(P, "            return .asked(reason: reason, fingerprint: fpMac, endpoint: endpoint)", "            return .asked(reason: reason, fingerprint: identity.fingerprint, endpoint: endpoint)")],
     "P15 the link's secret not the key": [(P, "            makeKey = { _ in PairingProof.qrKey(secret: link.secret) }", "            makeKey = { _ in PairingProof.qrKey(secret: Data(link.secret.reversed())) }")],
     "P16 the device's name not sent": [(P, "let request = PairRequest(method: method, proof: proof, name: deviceName, model: model)", "let request = PairRequest(method: method, proof: proof, name: \"Mac\", model: model)")],
+    # ClientConnection.swift and the session's resume (DCritelli/sill#9).
+    "K1 a final goodbye redialed": [(K, "            guard outcome.reconnect else { stopFor(outcome.text, storeLink: outcome.storeLink); return }\n", "")],
+    "K2 the goodbye ignored": [(K, "            self.goodbye = $0\n", "")],
+    "K3 the reason not surfaced": [(K, "stopFor(outcome.text, storeLink: outcome.storeLink)", "stopFor(\"Disconnected.\", storeLink: outcome.storeLink)")],
+    "K4 the App Store offer dropped": [(K, "stopFor(outcome.text, storeLink: outcome.storeLink)", "stopFor(outcome.text, storeLink: false)")],
+    "K5 no redial after a drop": [(K, "        queue.asyncAfter(deadline: .now() + wait) { [weak self] in\n            guard let self, self.running, self.generation == mine else { return }\n            self.launch()\n        }\n", "")],
+    "K6 Reconnecting not reported": [(K, "        onState?(.reconnecting(attempt: failures))\n", "")],
+    "K7 never up, still redialed": [(K, "        guard everConnected else {\n", "        guard everConnected || running else {\n")],
+    "K8 never gives up": [(K, "        guard failures < maxAttempts else {\n", "        guard failures < maxAttempts * 1000 else {\n")],
+    "K9 the first pick again": [(K, "pick: lastSource.map { .resume($0) } ?? pick", "pick: pick")],
+    "K10 the Source follows the pick only": [(K, "            if list.active != .none { self.lastSource = list.active }\n", "")],
+    "K11 redials after stop()": [(K, "            running = false\n            generation += 1\n            current?.stop()", "            current?.stop()")],
+    "K12 the Host looked up once": [(K, "        guard let target = dial() else {", "        guard let target = (dialled ?? dial()) else {"), (K, "    private var generation = 0\n", "    private var generation = 0\n    private var dialled: Dial?\n"), (K, "        goodbye = nil\n        attach?(session)", "        dialled = target\n        goodbye = nil\n        attach?(session)")],
+    "K14 the wait never grows": [(K, "        schedule[min(max(attempt, 0), schedule.count - 1)]", "        schedule[0]")],
+    "R1 a gone Window resumed": [(S, "        case .resume(.window(let id)) where list.windows.contains { $0.id == id }: source = .window(id)\n", "        case .resume(.window(let id)): source = .window(id)\n")],
+    "R2 the Desktop not resumed": [(S, "        case .resume: source = .desktop\n", "        case .resume: source = list.windows.first.map { .window($0.id) } ?? .desktop\n")],
+    "R3 the goodbye not handed on": [(S, "if let goodbye = Wire.decode(Goodbye.self, from: payload) { onGoodbye?(goodbye) }", "break")],
     # Not a mutant here: dropping `end`'s own `guard running`. The session cancels its connection as
     # it ends, so no second end can arrive (the reader stops on `running`, a cancelled connection
     # reports .cancelled, which is ignored); the guard stays for a stack that does.
@@ -76,7 +97,7 @@ for name, edits in MUTANTS.items():
         path = os.path.join(OUT, os.path.basename(f))
         open(path, "w").write(text)
         paths.append(path)
-    sources = paths + [SAVED, os.path.join(ROOT, "iOSClient/MessageReader.swift")] + sorted(glob.glob(os.path.join(ROOT, "Sources/StreamProtocol/*.swift")))
+    sources = paths + [SAVED, GOODBYE, os.path.join(ROOT, "iOSClient/MessageReader.swift")] + sorted(glob.glob(os.path.join(ROOT, "Sources/StreamProtocol/*.swift")))
     b = subprocess.run(["swiftc", "-O"] + sources + [os.path.join(SP, "main.swift"), "-o", os.path.join(OUT, "mutant")],
                        capture_output=True, text=True)
     if b.returncode != 0:

@@ -31,6 +31,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var found: [FoundHost] = []
     /// The one Host connection.
     private var session: ClientSession?
+    /// The session across drops (DCritelli/sill#9); `session` is its current one.
+    private var connection: ClientConnection?
+    private let latestViewport = Locked<Viewport>(Viewport(width: 960, height: 600, scale: nil, fps: 60))
     private var pairing: ClientPairing?
     /// Where the code typed next goes: the Host an ask reached, pinned to the key it answered with.
     private var codeTarget: (endpoint: NWEndpoint, pin: Data, name: String)?
@@ -89,7 +92,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
-    func applicationWillTerminate(_ notification: Notification) { session?.stop() }
+    func applicationWillTerminate(_ notification: Notification) { connection?.stop() }
 
     /// `sill://pair` links (CFBundleURLTypes), always behind a confirmation, as on the iOS app.
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -127,11 +130,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         model.status = nil
         switch row.kind {
         case .saved(let mac, let host):
-            guard let endpoint = host?.endpoint ?? ClientPairing.endpoint(of: mac), let pin = mac.fingerprintData else {
+            guard (host?.endpoint ?? ClientPairing.endpoint(of: mac)) != nil, let pin = mac.fingerprintData else {
                 model.status = "\(mac.name) isn\u{2019}t on this network. Open Sill on it, then try again."
                 return
             }
-            startSession(endpoint, parameters: pinned(pin), name: mac.name, macID: mac.macID, bonjourName: host?.name)
+            // Every redial looks the Host up again: its Bonjour row may have moved.
+            let now: () -> NWEndpoint? = { [weak self] in
+                guard let self else { return nil }
+                for row in HostRow.rows(saved: SavedHosts.all, found: self.found) {
+                    if case .saved(let m, let h) = row.kind, m.macID == mac.macID { return h?.endpoint ?? ClientPairing.endpoint(of: m) }
+                }
+                return nil
+            }
+            startSession(endpoint: now, parameters: { [weak self] in self?.pinned(pin) ?? ClientSession.refusingParameters() },
+                         name: mac.name, macID: mac.macID, bonjourName: host?.name, saved: true)
         case .found(let host):
             switch host.door {
             case .plain: startSession(host.endpoint, parameters: ClientSession.plainParameters(), name: host.name, macID: nil)
@@ -232,6 +244,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// One Host at a time: whatever was connected is let go first.
     private func startSession(_ endpoint: NWEndpoint, parameters: NWParameters, name: String, macID: String?, bonjourName: String? = nil) {
+        startSession(endpoint: { endpoint }, parameters: { parameters }, name: name, macID: macID, bonjourName: bonjourName, saved: false)
+    }
+
+    private func startSession(endpoint: @escaping () -> NWEndpoint?, parameters: @escaping () -> NWParameters, name: String,
+                              macID: String?, bonjourName: String? = nil, saved: Bool) {
         disconnect()
         streamWindow.title = name
         bar = BarModel()
@@ -250,12 +267,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         _ = viewports.displayChanged(maxFPS: fps, now: Self.now)
         _ = viewports.contentSizeChanged(size, now: Self.now)
         viewports.sessionStarted()   // nothing of this has been sent on the new connection
-        let session = ClientSession(endpoint: endpoint, parameters: parameters, hello: Self.hello,
-                                    pick: pick, viewport: Viewport(width: size.width, height: size.height, scale: nil, fps: fps))
+        let first_viewport = Viewport(width: size.width, height: size.height, scale: nil, fps: fps)
+        latestViewport.value = first_viewport
+        // Every dial asks on main, where the Bonjour rows live (the connection's queue is never waited on there).
+        let connection = ClientConnection(name: name, saved: saved, hello: Self.hello, pick: pick,
+                                          viewport: { [latestViewport] in latestViewport.value },
+                                          dial: {
+            DispatchQueue.main.sync { endpoint().map { ClientConnection.Dial(endpoint: $0, parameters: parameters()) } }
+        })
         var first = true
+        let video = self.video
+        connection.attach = { [weak self] session in
         session.onWindowList = { [weak self] list in
             DispatchQueue.main.async {
                 guard let self, self.session === session else { return }
+                self.container.hideStatus()
                 if first, let macID {
                     first = false
                     SavedHosts.connected(macID, bonjourName: bonjourName)
@@ -293,23 +319,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         session.onParameterSets = { [video] in video.apply($0) }
         session.onFrame = { [video] in video.enqueue($0, isKeyframe: $1) }
         session.onCursorShape = { [video] blob in DispatchQueue.main.async { video.setCursorShape(blob) } }
-        video.onInput = { [weak session] in session?.sendInput($0) }
-        session.onEnd = { [weak self] why in
-            print("Session ended: \(why)")
+        DispatchQueue.main.async {
+            guard let self, self.connection === connection else { return }
+            self.session = session
+            self.viewports.sessionStarted()   // nothing of this has been sent on the new connection
+        }
+        }
+        connection.onGoodbye = { print("Goodbye from \(name): \($0.reason)\($0.message.map { " (\($0))" } ?? "")") }
+        connection.onState = { [weak self] state in
+            print("Connection to \(name): \(state)")
             DispatchQueue.main.async {
-                guard let self, self.session === session else { return }
-                self.video.clear()
-                self.menus.reset()
-                self.streamWindow.title = "\(name) — disconnected"
-                self.model.status = "Disconnected from \(name)."
+                guard let self, self.connection === connection else { return }
+                switch state {
+                case .connecting, .connected:
+                    break
+                case .reconnecting:
+                    // The last picture stays under the message; nothing is sent while there is no session.
+                    self.session = nil
+                    self.menus.reset()
+                    self.streamWindow.title = "\(name) \u{2014} reconnecting"
+                    self.container.showStatus("Reconnecting\u{2026}")
+                case .stopped(let reason, _):
+                    self.session = nil
+                    self.menus.reset()
+                    self.streamWindow.title = "\(name) \u{2014} disconnected"
+                    self.model.status = reason
+                    self.container.showStatus(reason, actionTitle: "Connect to a Mac") { [weak self] in self?.showConnect(nil) }
+                }
             }
         }
-        self.session = session
+        video.onInput = { [weak self] in self?.session?.sendInput($0) }
+        self.connection = connection
         print("Connecting to \(name)")
         streamWindow.makeKeyAndOrderFront(nil)
         streamWindow.makeFirstResponder(video)
         connectWindow.window.orderOut(nil)
-        session.start()
+        connection.start()
     }
 
     // MARK: Viewport (DCritelli/sill#6)
@@ -318,7 +363,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// Sends a Viewport the policy made, and arms the timer for one it holds back.
     private func sendViewport(_ viewport: Viewport?) {
-        if let viewport { session?.sendViewport(viewport) }
+        if let viewport {
+            latestViewport.value = viewport
+            session?.sendViewport(viewport)
+        }
         viewportTimer?.invalidate()
         viewportTimer = nil
         guard let deadline = viewports.pendingDeadline else { return }
@@ -369,8 +417,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func disconnect() {
         rememberFrame()
-        session?.stop()
+        connection?.stop()
+        connection = nil
         session = nil
+        container.hideStatus()
         menus.reset()
         video.onInput = nil
         video.clear()
@@ -452,4 +502,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                      build: info?["CFBundleVersion"] as? String, protocol: SillProtocol.current,
                      device: model.map { "\(computerName) (\($0))" } ?? computerName)
     }()
+}
+
+/// A value shared between the main thread and the connection's queue.
+final class Locked<Value> {
+    private let lock = NSLock()
+    private var stored: Value
+    init(_ value: Value) { stored = value }
+    var value: Value {
+        get { lock.lock(); defer { lock.unlock() }; return stored }
+        set { lock.lock(); stored = newValue; lock.unlock() }
+    }
 }
