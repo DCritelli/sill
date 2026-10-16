@@ -22,6 +22,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private lazy var container = StreamContainerView(video: video)
     /// The Bar's state for the Host connected (DCritelli/sill#7); on main.
     private var bar = BarModel()
+    /// The Menus button's controller (DCritelli/sill#8); on main.
+    private let menus = MenusController()
     /// Where the stream window was left, for each Host (UserDefaults "SillFrames").
     private var frames = FrameMemory(data: UserDefaults.standard.data(forKey: "SillFrames") ?? Data())
     private var frameKey: String?
@@ -42,6 +44,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         streamWindow.contentView = container
         container.bar.onSelect = { [weak self] source in self?.session?.sendSource(source) }
         container.bar.onCommand = { [weak self] action, id in self?.session?.sendWindowCommand(WindowCommand(id: id, action: action)) }
+        container.bar.install(menusButton: menus.button)
+        menus.onFetch = { [weak self] in self?.session?.sendFetchMenu($0) }
+        menus.onPress = { [weak self] in self?.session?.sendPressMenuItem($0) }
         streamWindow.collectionBehavior.insert(.fullScreenPrimary)
         streamWindow.delegate = self
         video.onContentSize = { [weak self] size in
@@ -231,6 +236,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         streamWindow.title = name
         bar = BarModel()
         container.bar.update(bar)
+        menus.reset()
+        menus.setMacName(name)
         frameKey = FrameMemory.key(macID: macID, name: name)
         if let remembered = frames.frame(for: frameKey!), !streamWindow.isVisible {
             streamWindow.setFrame(streamWindow.constrainFrameRect(remembered, to: streamWindow.screen ?? NSScreen.main), display: false)
@@ -277,6 +284,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.container.bar.update(self.bar)
             }
         }
+        session.onMacMenu = { [weak self] menu in
+            DispatchQueue.main.async {
+                guard let self, self.session === session else { return }
+                self.menus.received(menu)
+            }
+        }
         session.onParameterSets = { [video] in video.apply($0) }
         session.onFrame = { [video] in video.enqueue($0, isKeyframe: $1) }
         session.onCursorShape = { [video] blob in DispatchQueue.main.async { video.setCursorShape(blob) } }
@@ -286,6 +299,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             DispatchQueue.main.async {
                 guard let self, self.session === session else { return }
                 self.video.clear()
+                self.menus.reset()
                 self.streamWindow.title = "\(name) — disconnected"
                 self.model.status = "Disconnected from \(name)."
             }
@@ -357,6 +371,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         rememberFrame()
         session?.stop()
         session = nil
+        menus.reset()
         video.onInput = nil
         video.clear()
     }

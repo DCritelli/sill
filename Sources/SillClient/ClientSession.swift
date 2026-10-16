@@ -36,6 +36,8 @@ final class ClientSession {
     /// A Window's thumbnail (kind 3, an `ImageBlob`) and an app's icon (kind 4), as they arrive (#7).
     var onThumbnail: ((Data) -> Void)?
     var onIcon: ((Data) -> Void)?
+    /// The Host's menus (kind 24): the app's top level, and the answers to fetches and presses (#8).
+    var onMacMenu: ((MacMenu) -> Void)?
     /// Once, when the session ends by itself (never after `stop()`), with a line for the log.
     var onEnd: ((String) -> Void)?
 
@@ -47,6 +49,7 @@ final class ClientSession {
     /// On `queue`.
     private var picked: StreamSource?
     private var running = false
+    private var subscribed = false
     private var pingTimer: DispatchSourceTimer?
 
     /// - `viewport`: sent right after the pick. The tracer's leaves the remote Window alone
@@ -158,6 +161,22 @@ final class ClientSession {
         }
     }
 
+    /// Asks for one menu's items (kind 27 with an id; #8). From any thread.
+    func sendFetchMenu(_ fetch: FetchMenu) {
+        queue.async { [self] in
+            guard running else { return }
+            send(.fetchMenu, Wire.encode(fetch))
+        }
+    }
+
+    /// Chooses a menu item on the Host (kind 25; #8). From any thread.
+    func sendPressMenuItem(_ press: PressMenuItem) {
+        queue.async { [self] in
+            guard running else { return }
+            send(.pressMenuItem, Wire.encode(press))
+        }
+    }
+
     /// Sends what the input translator made, each event one kind 8, in order. From any thread.
     func sendInput(_ events: [InputEvent]) {
         guard !events.isEmpty else { return }
@@ -181,6 +200,11 @@ final class ClientSession {
             guard let list = Wire.decode(WindowList.self, from: payload) else { return }
             onWindowList?(list)
             if picked == nil { choose(from: list) }
+            if !subscribed {
+                // The subscription to the menus (a kind 27 without an id): only a subscriber is served.
+                subscribed = true
+                send(.fetchMenu, Wire.encode(FetchMenu()))
+            }
         case .parameterSets:
             if let sets = ParameterSets(encoded: payload) { onParameterSets?(sets) }
         case .frame:
@@ -191,6 +215,8 @@ final class ClientSession {
             onThumbnail?(payload)
         case .appIcon:
             onIcon?(payload)
+        case .macMenu:
+            if let menu = Wire.decode(MacMenu.self, from: payload) { onMacMenu?(menu) }
         case .hostSettings:
             if let state = Wire.decode(HostSettingsState.self, from: payload) { onHostMaxFPS?(state.settings.maxFPS) }
         default:

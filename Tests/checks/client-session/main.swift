@@ -457,8 +457,8 @@ let cases: [(String, () -> Void)] = [
             check(host.received.first?.0 == .hello, "first: the hello is the first message")
             check(Wire.decode(Hello.self, from: host.received.first?.1 ?? Data()) == hello, "first: the hello carries the version, build, protocol and device")
             host.send(.windowList, Wire.encode(twoWindows))
-            check(wait(2) { kinds(host).count >= 3 }, "first: two more messages after the list")
-            check(kinds(host) == [.hello, .selectSource, .viewport], "first: hello, then the pick, then the Viewport")
+            check(wait(2) { kinds(host).count >= 4 }, "first: three more messages after the list")
+            check(kinds(host) == [.hello, .selectSource, .viewport, .fetchMenu], "first: hello, then the pick, the Viewport, the menus subscription")
             let picked = host.received.first { $0.0 == .selectSource }.flatMap { Wire.decode(StreamSource.self, from: $0.1) }
             check(picked == .window(41), "first: the first Window is picked")
             let sent = host.received.first { $0.0 == .viewport }.flatMap { Wire.decode(Viewport.self, from: $0.1) }
@@ -469,8 +469,8 @@ let cases: [(String, () -> Void)] = [
     ("eager", {
         let list = StreamMessage(kind: .windowList, timestamp: 1, isKeyframe: false, payload: Wire.encode(twoWindows)).serialized()
         withSession(pick: .firstWindow, eager: list) { host, _, _ in
-            check(wait(2) { kinds(host).count >= 3 }, "eager: the session answers a list sent on connect")
-            check(kinds(host) == [.hello, .selectSource, .viewport], "eager: still the hello first, then the pick and the Viewport")
+            check(wait(2) { kinds(host).count >= 4 }, "eager: the session answers a list sent on connect")
+            check(kinds(host) == [.hello, .selectSource, .viewport, .fetchMenu], "eager: still the hello first, then the pick, the Viewport and the menus subscription")
         }
     }),
     ("desktop", {

@@ -22,6 +22,18 @@ final class BarView: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
 
+    /// The Menus button (DCritelli/sill#8), at the trailing edge; MenusController owns it.
+    func install(menusButton button: NSButton) {
+        addSubview(button)
+        button.autoresizingMask = [.minXMargin]
+        button.frame = CGRect(x: bounds.width - 92, y: (Self.height - 28) / 2, width: 84, height: 28)
+    }
+
+    override func layout() {
+        super.layout()
+        for case let b as NSButton in subviews { b.frame.origin.x = bounds.width - b.frame.width - 8 }
+    }
+
     override func updateLayer() {
         layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
     }
