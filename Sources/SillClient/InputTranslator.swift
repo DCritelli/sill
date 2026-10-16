@@ -270,3 +270,109 @@ struct InputTranslator {
         return (x, y)
     }
 }
+
+/// The Mac Client's Viewport rules (DCritelli/sill#6), pure like the translator, with time passed in:
+/// what to ask the Host for, and when.
+///
+/// - **Window Source:** the stream view's content size in points with `scale` 1, so the Host
+///   resizes the real remote Window 1:1. **Desktop:** `scale` left out, so the Host leaves its
+///   screen alone, and a resize sends nothing (the picture just scales).
+/// - **Throttle:** during a drag the first size goes at once, later ones at most once per
+///   `resizeInterval`, the latest held (`pendingDeadline`: the shell calls `tick` then); the end of
+///   the resize (`resizeEnded`: a drag ending, entering or leaving full screen) sends the final size
+///   at once. A size equal to the one sent is never sent again.
+/// - **Frame rate:** the display's maximum refresh rate, capped by the Host's own frame rate limit
+///   when it has told us (kind 16); asked again at once when either changes (the window moved to
+///   another display), carrying the latest size.
+/// - Whatever the Host does with the size (an app's minimum), the picture is fitted with bars by
+///   `InputTranslator.pictureRect`.
+struct ViewportPolicy {
+    enum SourceKind { case window, desktop }
+
+    /// The least time between two sizes sent during a resize.
+    static let resizeInterval: TimeInterval = 0.1
+
+    var sourceKind = SourceKind.window
+    private var size = CGSize.zero
+    private var displayMaxFPS = 60
+    private var hostMaxFPS: Int?
+    private var lastSent: Viewport?
+    private var lastSentAt: TimeInterval = 0
+    private var held = false
+
+    /// The rate asked for.
+    var fps: Int { min(displayMaxFPS, hostMaxFPS ?? displayMaxFPS) }
+
+    /// When `tick` has a held size to send, nil when none is owed.
+    var pendingDeadline: TimeInterval? { held ? lastSentAt + Self.resizeInterval : nil }
+
+    /// A new connection: nothing has been sent on it.
+    mutating func sessionStarted() {
+        lastSent = nil
+        held = false
+    }
+
+    /// The stream view's content size changed (every layout pass of a drag).
+    mutating func contentSizeChanged(_ new: CGSize, now: TimeInterval) -> Viewport? {
+        size = new
+        guard differs else { held = false; return nil }
+        if lastSent == nil || now - lastSentAt >= Self.resizeInterval { return emit(now) }
+        held = true
+        return nil
+    }
+
+    /// The deadline passed: the latest held size.
+    mutating func tick(now: TimeInterval) -> Viewport? {
+        guard held, now - lastSentAt >= Self.resizeInterval else { return nil }
+        return differs ? emit(now) : { held = false; return nil }()
+    }
+
+    /// The drag ended, or full screen was entered or left: the final size, at once.
+    mutating func resizeEnded(now: TimeInterval) -> Viewport? {
+        differs ? emit(now) : { held = false; return nil }()
+    }
+
+    /// The Host shows another kind of Source: asked afresh at once.
+    mutating func sourceChanged(_ kind: SourceKind, now: TimeInterval) -> Viewport? {
+        guard kind != sourceKind else { return nil }
+        sourceKind = kind
+        return emit(now)
+    }
+
+    /// The window's display (or its refresh rate) changed.
+    mutating func displayChanged(maxFPS: Int, now: TimeInterval) -> Viewport? {
+        guard maxFPS > 0 else { return nil }
+        let before = fps
+        displayMaxFPS = maxFPS
+        return fps == before ? nil : emit(now)
+    }
+
+    /// The Host's frame rate limit (from its settings), nil when unknown.
+    mutating func hostMaxFPSChanged(_ limit: Int?, now: TimeInterval) -> Viewport? {
+        let before = fps
+        hostMaxFPS = limit.flatMap { $0 > 0 ? $0 : nil }
+        return fps == before ? nil : emit(now)
+    }
+
+    private var current: Viewport? {
+        guard size.width > 0, size.height > 0 else { return nil }
+        return Viewport(width: Double(size.width), height: Double(size.height),
+                        scale: sourceKind == .window ? 1 : nil, fps: fps)
+    }
+
+    /// Whether what would be sent differs from what was: the Desktop's size does not count, once sent.
+    private var differs: Bool {
+        guard let current else { return false }
+        guard let last = lastSent else { return true }
+        if current.fps != last.fps || current.scale != last.scale { return true }
+        return sourceKind == .window && (current.width != last.width || current.height != last.height)
+    }
+
+    private mutating func emit(_ now: TimeInterval) -> Viewport? {
+        held = false
+        guard let current else { return nil }
+        lastSent = current
+        lastSentAt = now
+        return current
+    }
+}

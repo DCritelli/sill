@@ -101,9 +101,13 @@ final class VideoView: NSView {
         return event.eventNumber == firstMouseNumber || !(window?.isKeyWindow ?? false)
     }
 
+    /// The content size changed (every layout pass of a resize; DCritelli/sill#6). On main.
+    var onContentSize: ((CGSize) -> Void)?
+
     override func layout() {
         super.layout()
         translator.contentSize = bounds.size
+        onContentSize?(bounds.size)
         placePicture()
     }
 

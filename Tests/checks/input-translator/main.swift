@@ -447,5 +447,92 @@ do {
     check(t.windowResignedKey() == [], "focus lost after it: no button to release")
 }
 
+// MARK: The Viewport (#6)
+
+func vp(_ w: Double, _ h: Double, scale: Double?, fps: Int) -> Viewport { Viewport(width: w, height: h, scale: scale, fps: fps) }
+
+do {
+    // A Window Source: the content size in points, scale 1, the display's rate.
+    var p = ViewportPolicy()
+    p.sourceKind = .window
+    _ = p.displayChanged(maxFPS: 120, now: 0)
+    check(p.contentSizeChanged(size(900, 600), now: 0) == vp(900, 600, scale: 1, fps: 120), "a Window: the content size, scale 1, 120 fps")
+    check(p.contentSizeChanged(size(900, 600), now: 5) == nil, "the same size again: nothing")
+    check(p.contentSizeChanged(size(0, 600), now: 10) == nil, "an empty size: nothing")
+}
+do {
+    // The Desktop: no scale, and a resize leaves the Host alone.
+    var p = ViewportPolicy()
+    p.sourceKind = .desktop
+    check(p.contentSizeChanged(size(900, 600), now: 0) == vp(900, 600, scale: nil, fps: 60), "the Desktop: no scale, 60 fps by default")
+    check(p.contentSizeChanged(size(1200, 800), now: 1) == nil && p.pendingDeadline == nil, "the Desktop resized: nothing sent, nothing owed")
+    check(p.resizeEnded(now: 2) == nil, "the Desktop's resize ended: nothing")
+    check(p.displayChanged(maxFPS: 120, now: 3) == vp(1200, 800, scale: nil, fps: 120), "the Desktop on a 120 Hz display: the new rate, still no scale")
+}
+do {
+    // Source changes.
+    var p = ViewportPolicy()
+    _ = p.contentSizeChanged(size(900, 600), now: 0)
+    check(p.sourceChanged(.desktop, now: 0.01) == vp(900, 600, scale: nil, fps: 60), "to the Desktop: sent at once, without a scale (inside the throttle)")
+    check(p.sourceChanged(.desktop, now: 0.02) == nil, "the same kind again: nothing")
+    check(p.sourceChanged(.window, now: 0.03) == vp(900, 600, scale: 1, fps: 60), "back to a Window: scale 1 at once")
+}
+do {
+    // The throttle during a drag, with the trailing and the final send.
+    var p = ViewportPolicy()
+    check(p.contentSizeChanged(size(800, 500), now: 0) == vp(800, 500, scale: 1, fps: 60), "drag: the first size goes at once")
+    check(p.contentSizeChanged(size(810, 500), now: 0.02) == nil, "drag: 20 ms later held")
+    check(p.contentSizeChanged(size(820, 500), now: 0.05) == nil, "drag: 50 ms later held")
+    check(p.pendingDeadline == 0.1, "drag: the held size is owed at 0.1 s")
+    check(p.tick(now: 0.09) == nil, "tick before the deadline: nothing")
+    check(p.tick(now: 0.1) == vp(820, 500, scale: 1, fps: 60), "tick at the deadline: the latest size, not the first held")
+    check(p.pendingDeadline == nil, "nothing owed after it")
+    check(p.contentSizeChanged(size(830, 500), now: 0.25) == vp(830, 500, scale: 1, fps: 60), "a size after the interval: at once")
+    check(p.contentSizeChanged(size(840, 500), now: 0.26) == nil, "and the next held")
+    check(p.resizeEnded(now: 0.27) == vp(840, 500, scale: 1, fps: 60), "the drag ends: the final size at once, inside the interval")
+    check(p.resizeEnded(now: 0.28) == nil, "ended again: nothing")
+    check(p.tick(now: 1) == nil, "no tick owes anything after the final")
+    // A held size that goes back to what was sent is owed nothing.
+    _ = p.contentSizeChanged(size(900, 500), now: 0.30)
+    _ = p.contentSizeChanged(size(840, 500), now: 0.31)
+    check(p.tick(now: 1) == nil && p.resizeEnded(now: 1) == nil, "back to the sent size: nothing to send")
+}
+do {
+    // A new session starts afresh.
+    var p = ViewportPolicy()
+    _ = p.contentSizeChanged(size(800, 500), now: 0)
+    p.sessionStarted()
+    check(p.contentSizeChanged(size(800, 500), now: 10) == vp(800, 500, scale: 1, fps: 60), "after a new session the same size is sent again")
+}
+do {
+    // Frame rate: the display's maximum, capped by the Host's setting, asked again on a move.
+    var p = ViewportPolicy()
+    _ = p.contentSizeChanged(size(800, 500), now: 0)
+    check(p.fps == 60, "default rate 60")
+    check(p.displayChanged(maxFPS: 120, now: 1) == vp(800, 500, scale: 1, fps: 120), "a 120 Hz display: 120 fps asked at once")
+    check(p.displayChanged(maxFPS: 120, now: 2) == nil, "the same display again: nothing")
+    check(p.hostMaxFPSChanged(60, now: 3) == vp(800, 500, scale: 1, fps: 60), "the Host limits to 60: 60 asked")
+    check(p.displayChanged(maxFPS: 144, now: 4) == nil && p.fps == 60, "a 144 Hz display under a 60 cap: still 60, nothing sent")
+    check(p.hostMaxFPSChanged(100, now: 5) == vp(800, 500, scale: 1, fps: 100), "the Host raises to 100: 100 (display 144)")
+    check(p.displayChanged(maxFPS: 60, now: 6) == vp(800, 500, scale: 1, fps: 60), "moved to a 60 Hz display: 60 asked again")
+    check(p.hostMaxFPSChanged(nil, now: 7) == nil && p.fps == 60, "no Host cap known: the display's rate")
+    check(p.displayChanged(maxFPS: 0, now: 8) == nil && p.fps == 60, "a display reporting 0: ignored")
+    // A rate change inside the throttle still goes at once with the held size.
+    var q = ViewportPolicy()
+    _ = q.contentSizeChanged(size(800, 500), now: 0)
+    _ = q.contentSizeChanged(size(810, 500), now: 0.01)
+    check(q.displayChanged(maxFPS: 120, now: 0.02) == vp(810, 500, scale: 1, fps: 120), "a rate change inside the throttle carries the latest size")
+    check(q.pendingDeadline == nil, "and owes nothing")
+}
+do {
+    // Bars: a remote Window that will not get as small as the local one, fitted undistorted.
+    // The view shrinks to 600×300; the Host's frame stays 1600×1000 (800×500 pt at 2x).
+    var t = translator(content: size(600, 300), frame: size(1600, 1000))
+    check(t.pictureRect == CGRect(x: 60, y: 0, width: 480, height: 300), "a window below the app's minimum: 16:10 picture, bars of 60 each side")
+    check(t.mouseMoved(to: pt(60, 150)) == [move(0, 0.5)] && t.mouseMoved(to: pt(40, 150)) == [], "positions follow the fitted picture, none from the bar")
+    t.frameSize = size(1200, 600)   // the remote Window then settles at 600×300 pt
+    check(t.pictureRect == CGRect(x: 0, y: 0, width: 600, height: 300), "the remote Window follows: the bars go")
+}
+
 print(failures == 0 ? "All \(checks) checks passed." : "\(failures) of \(checks) checks FAILED.")
 exit(failures == 0 ? 0 : 1)

@@ -102,6 +102,25 @@ MUTANTS = {
     "F8 keys released first pressed first": [("while let usage = keysDown.popLast()", "while let usage = keysDown.first.map({ keysDown.removeFirst(); return $0 })")],
     "F10 focus loss lets the right button go as left": [("out.append(.pointer(button == .left ? .leftUp : .rightUp", "out.append(.pointer(.leftUp")],
     "F9 the first click sent": [("guard !bringsWindowForward, let p = normalized(point) else", "guard let p = normalized(point) else")],
+    "V1 a Window's scale left out": [("scale: sourceKind == .window ? 1 : nil, fps: fps)", "scale: nil, fps: fps)")],
+    "V2 the Desktop sent a scale": [("scale: sourceKind == .window ? 1 : nil, fps: fps)", "scale: 1, fps: fps)")],
+    "V3 the Desktop's resize sent": [("return sourceKind == .window && (current.width", "return (current.width")],
+    "V4 no throttle": [("if lastSent == nil || now - lastSentAt >= Self.resizeInterval { return emit(now) }", "return emit(now)")],
+    "V5 never sent at once": [("if lastSent == nil || now - lastSentAt >= Self.resizeInterval { return emit(now) }", "if lastSent == nil { return emit(now) }")],
+    "V6 the held size lost": [("        held = true\n        return nil\n    }\n\n    /// The deadline", "        return nil\n    }\n\n    /// The deadline")],
+    "V7 tick before its deadline": [("guard held, now - lastSentAt >= Self.resizeInterval else { return nil }", "guard held else { return nil }")],
+    "V8 no final send": [("    mutating func resizeEnded(now: TimeInterval) -> Viewport? {\n        differs ? emit(now)", "    mutating func resizeEnded(now: TimeInterval) -> Viewport? {\n        false ? emit(now)")],
+    "V9 the same size sent again": [("        guard let last = lastSent else { return true }\n", "        guard let last = lastSent, false else { return true }\n")],
+    "V11 fps not capped by the Host": [("min(displayMaxFPS, hostMaxFPS ?? displayMaxFPS)", "displayMaxFPS")],
+    "V12 fps capped the wrong way": [("min(displayMaxFPS, hostMaxFPS ?? displayMaxFPS)", "max(displayMaxFPS, hostMaxFPS ?? displayMaxFPS)")],
+    "V13 a display change ignored": [("        displayMaxFPS = maxFPS\n", "")],
+    "V14 a display change not sent": [("return fps == before ? nil : emit(now)\n    }\n\n    /// The Host's", "return nil\n    }\n\n    /// The Host's")],
+    "V15 a 0 Hz display taken": [("guard maxFPS > 0 else { return nil }\n", "")],
+    "V16 a new session remembers": [("        lastSent = nil\n        held = false\n    }\n\n    /// The stream view", "        held = false\n    }\n\n    /// The stream view")],
+    "V17 a source change not sent": [("        sourceKind = kind\n        return emit(now)", "        sourceKind = kind\n        return nil")],
+    "V18 an empty size sent": [("guard size.width > 0, size.height > 0 else { return nil }", "guard size.width >= 0 else { return nil }")],
+    "V19 the width and height swapped": [("Viewport(width: Double(size.width), height: Double(size.height),", "Viewport(width: Double(size.height), height: Double(size.width),")],
+    "V20 the deadline from the wrong time": [("held ? lastSentAt + Self.resizeInterval : nil", "held ? lastSentAt : nil")],
 }
 caught = 0
 for name, edits in MUTANTS.items():
@@ -116,7 +135,8 @@ for name, edits in MUTANTS.items():
     if src is None: continue
     path = os.path.join(OUT, "InputTranslator.swift")
     open(path, "w").write(src)
-    b = subprocess.run(["swiftc", "-O", path, os.path.join(ROOT, "Sources/StreamProtocol/Input.swift"),
+    b = subprocess.run(["swiftc", "-O", path, os.path.join(ROOT, "Sources/StreamProtocol/Input.swift"), os.path.join(ROOT, "Sources/StreamProtocol/Viewport.swift"),
+                        os.path.join(ROOT, "Sources/StreamProtocol/StreamMessage.swift"),
                         os.path.join(SP, "main.swift"), "-o", os.path.join(OUT, "mutant")], capture_output=True, text=True)
     if b.returncode != 0:
         print(f"{name}: DOES NOT COMPILE\n{b.stderr[:600]}"); continue

@@ -16,6 +16,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var model: ConnectModel { connectWindow.model }
     private var streamWindow: NSWindow!
     private let video = VideoView(frame: NSRect(x: 0, y: 0, width: 960, height: 600))
+    /// What to ask the Host for as the window resizes and moves (DCritelli/sill#6); on main.
+    private var viewports = ViewportPolicy()
+    private var viewportTimer: Timer?
     private let browser = HostBrowser()
     private var found: [FoundHost] = []
     /// The one Host connection.
@@ -31,7 +34,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                 backing: .buffered, defer: false)
         streamWindow.isReleasedWhenClosed = false
         streamWindow.contentView = video
+        streamWindow.collectionBehavior.insert(.fullScreenPrimary)
         streamWindow.delegate = self
+        video.onContentSize = { [weak self] size in
+            guard let self else { return }
+            self.sendViewport(self.viewports.contentSizeChanged(size, now: Self.now))
+        }
         NSApp.mainMenu = Self.mainMenu()
 
         model.onConnect = { [weak self] in self?.connect($0) }
@@ -216,6 +224,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let pick: ClientSession.Pick = UserDefaults.standard.string(forKey: "SillSource") == "desktop" ? .desktop : .firstWindow
         let size = video.bounds.size
         let fps = streamWindow.screen?.maximumFramesPerSecond ?? NSScreen.main?.maximumFramesPerSecond ?? 60
+        viewports.sourceKind = .window
+        _ = viewports.hostMaxFPSChanged(nil, now: Self.now)
+        _ = viewports.displayChanged(maxFPS: fps, now: Self.now)
+        _ = viewports.contentSizeChanged(size, now: Self.now)
+        viewports.sessionStarted()   // nothing of this has been sent on the new connection
         let session = ClientSession(endpoint: endpoint, parameters: parameters, hello: Self.hello,
                                     pick: pick, viewport: Viewport(width: size.width, height: size.height, scale: nil, fps: fps))
         var first = true
@@ -250,6 +263,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         streamWindow.makeFirstResponder(video)
         connectWindow.window.orderOut(nil)
         session.start()
+    }
+
+    // MARK: Viewport (DCritelli/sill#6)
+
+    private static var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+    /// Sends a Viewport the policy made, and arms the timer for one it holds back.
+    private func sendViewport(_ viewport: Viewport?) {
+        if let viewport { session?.sendViewport(viewport) }
+        viewportTimer?.invalidate()
+        viewportTimer = nil
+        guard let deadline = viewports.pendingDeadline else { return }
+        // Common modes: a live resize tracks the event loop in its own mode.
+        let timer = Timer(timeInterval: max(deadline - Self.now, 0.005), repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.viewportTimer = nil
+            self.sendViewport(self.viewports.tick(now: Self.now))
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        viewportTimer = timer
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        sendViewport(viewports.resizeEnded(now: Self.now))
+    }
+
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        sendViewport(viewports.resizeEnded(now: Self.now))
+    }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        sendViewport(viewports.resizeEnded(now: Self.now))
+    }
+
+    /// Another display: its maximum refresh rate is asked for.
+    func windowDidChangeScreen(_ notification: Notification) {
+        guard let fps = streamWindow.screen?.maximumFramesPerSecond else { return }
+        sendViewport(viewports.displayChanged(maxFPS: fps, now: Self.now))
     }
 
     private func disconnect() {

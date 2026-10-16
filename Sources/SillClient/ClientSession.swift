@@ -29,6 +29,10 @@ final class ClientSession {
     var onFrame: ((Data, Bool) -> Void)?
     /// The Host's cursor shape (kind 14), a `CursorShapeBlob`, whenever it changes.
     var onCursorShape: ((Data) -> Void)?
+    /// The Host's frame rate limit (kind 16's `maxFPS`), whenever its settings arrive (#6).
+    var onHostMaxFPS: ((Int) -> Void)?
+    /// The Source the session picked, once, right after it sent the pick (#6).
+    var onPicked: ((StreamSource) -> Void)?
     /// Once, when the session ends by itself (never after `stop()`), with a line for the log.
     var onEnd: ((String) -> Void)?
 
@@ -127,6 +131,14 @@ final class ClientSession {
         }
     }
 
+    /// Sends a Viewport (a resize, a rate change; #6). From any thread.
+    func sendViewport(_ viewport: Viewport) {
+        queue.async { [self] in
+            guard running else { return }
+            send(.viewport, Wire.encode(viewport))
+        }
+    }
+
     /// Sends what the input translator made, each event one kind 8, in order. From any thread.
     func sendInput(_ events: [InputEvent]) {
         guard !events.isEmpty else { return }
@@ -156,6 +168,8 @@ final class ClientSession {
             onFrame?(payload, header.isKeyframe)
         case .cursorShape:
             onCursorShape?(payload)
+        case .hostSettings:
+            if let state = Wire.decode(HostSettingsState.self, from: payload) { onHostMaxFPS?(state.settings.maxFPS) }
         default:
             break   // pongs, ticks, thumbnails, icons, settings: later tickets
         }
@@ -170,6 +184,7 @@ final class ClientSession {
         picked = source
         send(.selectSource, Wire.encode(source))
         send(.viewport, Wire.encode(viewport))
+        onPicked?(source)
     }
 
     private func startPinging() {
