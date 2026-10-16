@@ -255,8 +255,8 @@ final class StreamContainerView: NSView {
     private func pointerMoved(to p: CGPoint) {
         guard visibility.fullScreen else { return }
         let at = visibility.pointerAtTop
-            ? BarVisibility.stillRevealed(pointerY: p.y, barHeight: BarView.height, in: bounds.height)
-            : BarVisibility.reveals(pointerY: p.y, in: bounds.height)
+            ? BarVisibility.stillRevealed(pointerY: p.y, barHeight: BarView.height)
+            : BarVisibility.reveals(pointerY: p.y)
         setPointerAtTop(at)
     }
 

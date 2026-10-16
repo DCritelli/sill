@@ -102,11 +102,10 @@ struct BarVisibility {
     mutating func toggle() { userHidden.toggle() }
 
     /// How far down from the top edge, in points, the pointer reveals a hidden Bar.
-    let topEdgeBand: CGFloat = BarVisibility.edgeBand
     static let edgeBand: CGFloat = 4
-    static func reveals(pointerY y: CGFloat, in height: CGFloat) -> Bool { y <= edgeBand }
+    static func reveals(pointerY y: CGFloat) -> Bool { y <= edgeBand }
     /// A revealed Bar stays while the pointer is over it.
-    static func stillRevealed(pointerY y: CGFloat, barHeight: CGFloat, in height: CGFloat) -> Bool { y <= barHeight }
+    static func stillRevealed(pointerY y: CGFloat, barHeight: CGFloat) -> Bool { y <= barHeight }
 }
 
 /// The stream window's frame for each Host, as the window reopens where it was left.

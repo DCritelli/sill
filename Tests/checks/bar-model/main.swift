@@ -128,11 +128,11 @@ do {
     v.fullScreen = false
     v.pointerAtTop = false
     check(v.visible, "leaving full screen brings the Bar back")
-    check(v.topEdgeBand == 4 && BarVisibility.reveals(pointerY: 3, in: 900) && !BarVisibility.reveals(pointerY: 10, in: 900),
+    check(BarVisibility.reveals(pointerY: 3) && !BarVisibility.reveals(pointerY: 10),
           "the top edge is a band of 4 points")
-    check(BarVisibility.reveals(pointerY: 0, in: 900) && BarVisibility.reveals(pointerY: -2, in: 900), "at and above the edge reveals")
+    check(BarVisibility.reveals(pointerY: 0) && BarVisibility.reveals(pointerY: -2), "at and above the edge reveals")
     // The shown Bar keeps showing while the pointer is over it (its own height).
-    check(BarVisibility.stillRevealed(pointerY: 60, barHeight: 78, in: 900) && !BarVisibility.stillRevealed(pointerY: 90, barHeight: 78, in: 900),
+    check(BarVisibility.stillRevealed(pointerY: 60, barHeight: 78) && !BarVisibility.stillRevealed(pointerY: 90, barHeight: 78),
           "a revealed Bar stays while the pointer is over it")
 }
 

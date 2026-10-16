@@ -461,6 +461,19 @@ do {
     check(p.contentSizeChanged(size(0, 600), now: 10) == nil, "an empty size: nothing")
 }
 do {
+    // A new connection's first Viewport comes from the policy (DCritelli/sill#1 review).
+    var p = ViewportPolicy()
+    p.sourceKind = .window
+    _ = p.displayChanged(maxFPS: 120, now: 0)
+    _ = p.hostMaxFPSChanged(60, now: 0)
+    p.sessionStarted()
+    check(p.contentSizeChanged(size(900, 600), now: 1) == vp(900, 600, scale: 1, fps: 60), "first Viewport of a Window: scale 1, capped by the Host")
+    var d = ViewportPolicy()
+    d.sourceKind = .desktop
+    d.sessionStarted()
+    check(d.contentSizeChanged(size(900, 600), now: 1) == vp(900, 600, scale: nil, fps: 60), "first Viewport of the Desktop: no scale")
+}
+do {
     // The Desktop: no scale, and a resize leaves the Host alone.
     var p = ViewportPolicy()
     p.sourceKind = .desktop

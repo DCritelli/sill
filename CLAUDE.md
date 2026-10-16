@@ -4607,7 +4607,11 @@ good.
   (and a minimal main menu: Hide, Quit, Minimize, Close, reachable by mouse), `InputTranslator`
   (the spec's Seam 1: Mac-side happenings in, InputEvents and the picture's rectangle out; key
   codes to HID usages, the keypad as text, modifier keys as their own events; pure,
-  `Tests/checks/input-translator`), and
+  `Tests/checks/input-translator`; and the `ViewportPolicy`), `BarModel` (the Bar's Windows,
+  Source, visibility and the remembered frame; pure, `Tests/checks/bar-model`) and `BarView`,
+  `MenusModel` (the Menus button's state; pure, `Tests/checks/menus-model`) and
+  `MenusController`, `ClientConnection` (the session with its reconnect), `ClientPairing`,
+  `ClientIdentity` (the Mac Client's key), `ConnectWindow` (Connect to a Mac), and
   `MessageReader.swift`, a symlink into iOSClient/ (ADR-0002).
 - `Packaging/` — Sill.app's `Info.plist` and the development entitlements
   (get-task-allow only), the release's (`SillRelease.entitlements`:
@@ -4980,7 +4984,7 @@ good.
   caught), and `build.sh` where a check compiles a module (StreamProtocol's
   sources with `import StreamProtocol` stripped), or a `module.txt` naming the
   files `module.py` compiles as one module (pairing at home's checks):
-  `addresses`, `ask-limits`, `cable-link`, `client-session`, `clientlink`, `compatibility`,
+  `addresses`, `ask-limits`, `bar-model`, `cable-link`, `client-session`, `clientlink`, `compatibility`,
   `device-gate`, `dmg-layout` (Scripts/dmg-layout's `.DS_Store` and alias
   writer, against Finder's own layout of the file, make-dmg.sh's layout
   arguments and the SVG's size and edge), `door-policy`, `duo` (DuoPosture;
@@ -4991,7 +4995,7 @@ good.
   `key-strokes` (the
   host's KeyStrokes and the device's KeyChords, against a model of the Mac's
   HID state table and of a Mac from before), `ledger`,
-  `menu-state` (iOSClient's MacMenuState), `menus` (the host's MenuFormat and
+  `menu-state` (iOSClient's MacMenuState), `menus-model` (the Mac Client's Menus button), `menus` (the host's MenuFormat and
   MenuPolicy, and MacMenu.swift's JSON), `message-reader`, `origin`,
   `pairing-address`, `phone-portrait`, `pointer-control`, `pointer-presence`,
   `pointer-watch`, `policy` (with its `home.swift`), `protocol`,

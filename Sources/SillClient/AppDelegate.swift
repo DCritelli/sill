@@ -262,12 +262,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let pick: ClientSession.Pick = UserDefaults.standard.string(forKey: "SillSource") == "desktop" ? .desktop : .firstWindow
         let size = video.bounds.size
         let fps = streamWindow.screen?.maximumFramesPerSecond ?? NSScreen.main?.maximumFramesPerSecond ?? 60
-        viewports.sourceKind = .window
+        viewports.sourceKind = pick == .desktop ? .desktop : .window
         _ = viewports.hostMaxFPSChanged(nil, now: Self.now)
         _ = viewports.displayChanged(maxFPS: fps, now: Self.now)
-        _ = viewports.contentSizeChanged(size, now: Self.now)
-        viewports.sessionStarted()   // nothing of this has been sent on the new connection
-        let first_viewport = Viewport(width: size.width, height: size.height, scale: nil, fps: fps)
+        viewports.sessionStarted()   // nothing has been sent on the new connection
+        // The first Viewport comes from the policy: content size, scale 1 for a Window (none for the Desktop).
+        let first_viewport = viewports.contentSizeChanged(size, now: Self.now)
+            ?? Viewport(width: 960, height: 600, scale: viewports.sourceKind == .window ? 1 : nil, fps: fps)
         latestViewport.value = first_viewport
         // Every dial asks on main, where the Bonjour rows live (the connection's queue is never waited on there).
         let connection = ClientConnection(name: name, saved: saved, hello: Self.hello, pick: pick,
@@ -278,6 +279,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         var first = true
         let video = self.video
         connection.attach = { [weak self] session in
+        session.onHostMaxFPS = { [weak self] limit in
+            DispatchQueue.main.async {
+                guard let self, self.session === session else { return }
+                self.sendViewport(self.viewports.hostMaxFPSChanged(limit, now: Self.now))
+            }
+        }
         session.onWindowList = { [weak self] list in
             DispatchQueue.main.async {
                 guard let self, self.session === session else { return }
