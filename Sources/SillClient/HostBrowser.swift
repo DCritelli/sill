@@ -2,33 +2,39 @@ import Foundation
 import Network
 import StreamProtocol
 
-/// Finds Hosts on the home network (`_sill._tcp`) and reports the first one whose home door is
-/// plain, which is what the tracer can dial without pairing: SillHost without `--pairing`. Doors
-/// that need pairing are skipped and logged until DCritelli/sill#2. Callbacks on main.
+/// A Host on the home network, as its Bonjour row describes it.
+struct FoundHost: Equatable {
+    /// The service name ("Noah's MacBook Pro").
+    var name: String
+    var endpoint: NWEndpoint
+    /// How its home door speaks (TXT `p`): plain, TLS with pairing required, or TLS open to any Device.
+    var door: HomeDoorTXT.Door
+    /// Its recognition tag (TXT `r`), which a saved Host's recognition key resolves.
+    var tag: String?
+}
+
+/// Finds Hosts on the home network (`_sill._tcp`) and reports every one, whenever the list changes
+/// (DCritelli/sill#2: Connect to a Mac lists them all, plain doors and TLS ones). Callbacks on main.
 final class HostBrowser {
-    var onFound: ((NWEndpoint, String) -> Void)?
-    private let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_sill._tcp", domain: nil), using: .tcp)
-    private var reported = false
-    private var skipped: Set<String> = []
+    var onChange: (([FoundHost]) -> Void)?
+    private var browser: NWBrowser?
 
     func start() {
+        guard browser == nil else { return }
+        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_sill._tcp", domain: nil), using: .tcp)
         browser.browseResultsChangedHandler = { [weak self] results, _ in
-            guard let self, !reported else { return }
-            for result in results {
-                let name: String
-                if case .service(let n, _, _, _) = result.endpoint { name = n } else { name = "\(result.endpoint)" }
+            let hosts = results.compactMap { result -> FoundHost? in
+                guard case .service(let name, _, _, _) = result.endpoint else { return nil }
                 // No TXT record reads as a plain door, as the iOS app reads it.
                 var door = HomeDoorTXT.Door.plain
-                if case .bonjour(let txt) = result.metadata { door = HomeDoorTXT.door(txt) }
-                guard door == .plain else {
-                    if skipped.insert(name).inserted { print("Skipping \(name): its door needs pairing, which comes with #2") }
-                    continue
+                var tag: String?
+                if case .bonjour(let txt) = result.metadata {
+                    door = HomeDoorTXT.door(txt)
+                    if case .string(let r)? = txt.getEntry(for: RecognitionTag.txtKey) { tag = r }
                 }
-                reported = true
-                browser.cancel()
-                onFound?(result.endpoint, name)
-                return
+                return FoundHost(name: name, endpoint: result.endpoint, door: door, tag: tag)
             }
+            self?.onChange?(hosts.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending })
         }
         browser.stateUpdateHandler = { state in
             switch state {
@@ -39,7 +45,11 @@ final class HostBrowser {
             }
         }
         browser.start(queue: .main)
+        self.browser = browser
     }
 
-    func stop() { browser.cancel() }
+    func stop() {
+        browser?.cancel()
+        browser = nil
+    }
 }
